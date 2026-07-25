@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""
+Surface validation: tree-sitter dependency cone extraction
+Hypothesis: cone-scoped context is significantly smaller than full-file context
+
+Measures:
+  1. Can we reliably extract symbol → callers/callees from real TS?
+  2. Token ratio: cone-constrained vs full file
+"""
+
+import os, sqlite3, json, re
+from pathlib import Path
+from collections import defaultdict, deque
+import tiktoken
+from tree_sitter import Language, Parser
+import tree_sitter_typescript as ts_typescript
+
+# ── Setup ────────────────────────────────────────────────────────────────────
+TS_LANGUAGE = Language(ts_typescript.language_typescript())
+parser = Parser(TS_LANGUAGE)
+enc = tiktoken.get_encoding("cl100k_base")
+
+TARGET_DIR = Path("/root/repos/twenty-dollar/frontend/src/lib")
+
+def tokens(text: str) -> int:
+    return len(enc.encode(text))
+
+
+# ── AST extraction ───────────────────────────────────────────────────────────
+def parse_file(path: Path):
+    src = path.read_bytes()
+    return src, parser.parse(src)
+
+
+def extract_symbols(src: bytes, tree, file_str: str) -> list[dict]:
+    """Return function/class/arrow declarations with byte spans."""
+    out = []
+
+    def first_ident(node) -> str | None:
+        for c in node.children:
+            if c.type in ("identifier", "property_identifier"):
+                return src[c.start_byte:c.end_byte].decode("utf-8", errors="replace")
+        return None
+
+    def walk(node, parent=None):
+        t = node.type
+        if t in ("function_declaration", "function_expression"):
+            name = first_ident(node)
+            if name:
+                out.append(dict(name=name, file=file_str, kind="function",
+                                start=node.start_byte, end=node.end_byte))
+        elif t == "method_definition":
+            name = first_ident(node)
+            if name and parent:
+                out.append(dict(name=f"{parent}.{name}", file=file_str, kind="method",
+                                start=node.start_byte, end=node.end_byte))
+        elif t == "class_declaration":
+            name = first_ident(node)
+            if name:
+                out.append(dict(name=name, file=file_str, kind="class",
+                                start=node.start_byte, end=node.end_byte))
+                for c in node.children:
+                    walk(c, parent=name)
+                return
+        elif t == "lexical_declaration":
+            for c in node.children:
+                if c.type == "variable_declarator":
+                    vname = first_ident(c)
+                    for sub in c.children:
+                        if sub.type == "arrow_function" and vname:
+                            out.append(dict(name=vname, file=file_str, kind="arrow",
+                                            start=node.start_byte, end=node.end_byte))
+        for c in node.children:
+            walk(c, parent)
+
+    walk(tree.root_node)
+    return out
+
+
+def extract_calls(src: bytes, tree) -> set[str]:
+    """Called identifiers within this file (simple + member.prop)."""
+    calls = set()
+
+    def walk(node):
+        if node.type == "call_expression":
+            fn = node.child_by_field_name("function")
+            if fn:
+                if fn.type == "identifier":
+                    calls.add(src[fn.start_byte:fn.end_byte].decode("utf-8", errors="replace"))
+                elif fn.type == "member_expression":
+                    prop = fn.child_by_field_name("property")
+                    if prop:
+                        calls.add(src[prop.start_byte:prop.end_byte].decode("utf-8", errors="replace"))
+        for c in node.children:
+            walk(c)
+
+    walk(tree.root_node)
+    return calls
+
+
+def extract_imports(src: bytes, tree) -> list[str]:
+    """All import paths referenced by this file (relative and aliased)."""
+    imps = []
+
+    def walk(node):
+        if node.type == "import_statement":
+            for c in node.children:
+                if c.type == "string":
+                    val = src[c.start_byte:c.end_byte].decode("utf-8", errors="replace").strip("\"'")
+                    # capture relative and alias imports; skip bare node_modules
+                    if val.startswith(".") or "/" in val:
+                        imps.append(val)
+        for c in node.children:
+            walk(c)
+
+    walk(tree.root_node)
+    return imps
+
+
+# ── Graph build ───────────────────────────────────────────────────────────────
+def build_call_file_edges(call_edges: dict, symbols: dict) -> dict[str, set]:
+    """Resolve called names → defining files. Returns file → set[file]."""
+    name_to_file = {name: sym["file"] for name, sym in symbols.items()}
+    result: dict[str, set] = defaultdict(set)
+    for calling_file, called_names in call_edges.items():
+        for name in called_names:
+            if name in name_to_file:
+                target = name_to_file[name]
+                if target != calling_file:
+                    result[calling_file].add(target)
+    return result
+
+
+# ── Path alias resolution ─────────────────────────────────────────────────────
+def load_path_aliases(target_dir: Path) -> list[tuple[str, str]]:
+    """Walk up from target_dir to find tsconfig.json and extract path aliases.
+    Returns [(pattern_prefix, replacement_prefix), ...] sorted longest-first."""
+    for candidate in [target_dir, *target_dir.parents]:
+        tsconfig = candidate / "tsconfig.json"
+        if tsconfig.exists():
+            try:
+                data = json.loads(tsconfig.read_text())
+                base_url = (candidate / data.get("compilerOptions", {}).get("baseUrl", ".")).resolve()
+                paths = data.get("compilerOptions", {}).get("paths", {})
+                aliases = []
+                for pattern, replacements in paths.items():
+                    prefix = pattern.rstrip("/*").rstrip("/")
+                    for rep in replacements[:1]:
+                        rep_prefix = (base_url / rep.rstrip("/*").rstrip("/")).resolve()
+                        aliases.append((prefix, str(rep_prefix)))
+                return sorted(aliases, key=lambda x: -len(x[0]))
+            except Exception:
+                pass
+    return []
+
+
+def resolve_import(imp: str, current_file: Path, target_dir: Path,
+                   aliases: list[tuple[str, str]]) -> str | None:
+    """Resolve an import path to a repo-relative string, or None if unresolvable."""
+    if imp.startswith("."):
+        resolved = (current_file.parent / imp).resolve()
+        for ext in ("", ".ts", ".tsx"):
+            candidate = Path(str(resolved) + ext)
+            if candidate.exists():
+                try:
+                    return str(candidate.relative_to(target_dir))
+                except ValueError:
+                    pass
+        return None
+    for prefix, rep_prefix in aliases:
+        if imp == prefix or imp.startswith(prefix + "/"):
+            suffix = imp[len(prefix):].lstrip("/")
+            resolved = Path(rep_prefix) / suffix
+            for ext in ("", ".ts", ".tsx"):
+                candidate = Path(str(resolved) + ext)
+                if candidate.exists():
+                    try:
+                        return str(candidate.relative_to(target_dir))
+                    except ValueError:
+                        pass
+    return None
+
+
+def build_graph(target_dir: Path):
+    """Parse all .ts files; return (symbols dict, call edges, import edges)."""
+    symbols: dict[str, dict] = {}        # name → symbol record
+    sym_by_file: dict[str, list] = defaultdict(list)
+    call_edges: dict[str, set] = defaultdict(set)   # caller_file → {called_name}
+    import_edges: dict[str, list] = defaultdict(list)  # file → [imported_file]
+    sources: dict[str, bytes] = {}
+
+    aliases = load_path_aliases(target_dir)
+    ts_files = list(target_dir.rglob("*.ts")) + list(target_dir.rglob("*.tsx"))
+    parse_errors = 0
+    unresolved_imports = 0
+
+    for path in ts_files:
+        rel = str(path.relative_to(target_dir))
+        try:
+            src, tree = parse_file(path)
+        except Exception as e:
+            parse_errors += 1
+            continue
+
+        sources[rel] = src
+        syms = extract_symbols(src, tree, rel)
+        for s in syms:
+            symbols[s["name"]] = s
+            sym_by_file[rel].append(s["name"])
+
+        calls = extract_calls(src, tree)
+        call_edges[rel] = calls
+
+        raw_imps = extract_imports(src, tree)
+        resolved = []
+        for imp in raw_imps:
+            r = resolve_import(imp, path, target_dir, aliases)
+            if r:
+                resolved.append(r)
+            else:
+                unresolved_imports += 1
+                # fall back to call-edge layer — don't drop, just skip import edge
+        import_edges[rel] = resolved
+
+    call_file_edges = build_call_file_edges(call_edges, symbols)
+    return symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, ts_files, parse_errors
+
+
+# ── Cone computation ─────────────────────────────────────────────────────────
+def compute_cone(target_name: str, symbols: dict, sym_by_file: dict,
+                 call_file_edges: dict, import_edges: dict) -> set[str]:
+    """BFS: files reachable from target symbol via call-file edges + imports."""
+    if target_name not in symbols:
+        return set()
+    origin_file = symbols[target_name]["file"]
+    visited_files = set()
+    queue = deque([origin_file])
+    while queue:
+        f = queue.popleft()
+        if f in visited_files:
+            continue
+        visited_files.add(f)
+        # follow call-resolved file edges
+        for target_file in call_file_edges.get(f, set()):
+            if target_file not in visited_files:
+                queue.append(target_file)
+        # follow import edges — already resolved to repo-relative paths by build_graph
+        for resolved_file in import_edges.get(f, []):
+            if resolved_file in sym_by_file and resolved_file not in visited_files:
+                queue.append(resolved_file)
+    return visited_files
+
+
+# ── Measurement ───────────────────────────────────────────────────────────────
+def measure(symbols, sym_by_file, call_file_edges, import_edges, sources, all_files):
+    total_repo_tokens = sum(tokens(s.decode("utf-8", errors="replace")) for s in sources.values())
+    total_files = len(all_files)
+
+    results = []
+    # sample: symbols reachable via import or call edges
+    sampled = [
+        name for name, sym in symbols.items()
+        if len(import_edges.get(sym["file"], [])) > 0
+        or len(call_file_edges.get(sym["file"], set())) > 0
+    ][:20]
+
+    for name in sampled:
+        cone_files = compute_cone(name, symbols, sym_by_file, call_file_edges, import_edges)
+        cone_tokens = sum(
+            tokens(sources[f].decode("utf-8", errors="replace"))
+            for f in cone_files if f in sources
+        )
+        origin = symbols[name]["file"]
+        origin_tokens = tokens(sources[origin].decode("utf-8", errors="replace")) if origin in sources else 0
+        results.append(dict(
+            name=name,
+            kind=symbols[name]["kind"],
+            origin_file=origin,
+            cone_files=len(cone_files),
+            cone_tokens=cone_tokens,
+            origin_tokens=origin_tokens,
+            cone_ratio=round(cone_tokens / total_repo_tokens * 100, 1),
+        ))
+
+    return results, total_repo_tokens, total_files
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print(f"Parsing {TARGET_DIR} ...")
+    symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, all_files, errors = build_graph(TARGET_DIR)
+
+    print(f"  Files parsed:  {len(all_files) - errors} / {len(all_files)}")
+    print(f"  Parse errors:  {errors}")
+    print(f"  Symbols found: {len(symbols)}")
+    print(f"  Files w/ calls: {sum(1 for v in call_edges.values() if v)}")
+    print(f"  Cross-file call edges: {sum(len(v) for v in call_file_edges.values())}")
+    print()
+
+    results, total_tokens, total_files = measure(
+        symbols, sym_by_file, call_file_edges, import_edges, sources, all_files
+    )
+
+    print(f"{'Symbol':<40} {'Kind':<8} {'Cone files':>10} {'Cone tok':>10} {'Origin tok':>11} {'% of repo':>10}")
+    print("-" * 95)
+    for r in sorted(results, key=lambda x: x["cone_tokens"]):
+        print(f"{r['name'][:39]:<40} {r['kind']:<8} {r['cone_files']:>10} "
+              f"{r['cone_tokens']:>10,} {r['origin_tokens']:>11,} {r['cone_ratio']:>9.1f}%")
+
+    print()
+    print(f"Total repo tokens (lib/): {total_tokens:,}")
+    print(f"Total files: {total_files}")
+    if results:
+        avg_ratio = sum(r["cone_ratio"] for r in results) / len(results)
+        avg_files = sum(r["cone_files"] for r in results) / len(results)
+        print(f"Avg cone size: {avg_ratio:.1f}% of repo, {avg_files:.1f} files")
+        print(f"Avg cone reduction vs full repo: {100 - avg_ratio:.1f}%")
