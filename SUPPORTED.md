@@ -4,7 +4,7 @@
 
 | Language | Extensions | Status | Notes |
 |----------|-----------|--------|-------|
-| TypeScript | `.ts`, `.tsx` | ✅ Full | JSX/TSX, path aliases via tsconfig |
+| TypeScript | `.ts`, `.tsx` | ✅ Full | JSX/TSX, path aliases via tsconfig, type hierarchy |
 | JavaScript | `.js`, `.jsx` | ✅ via TS parser | Same parser handles JS |
 | Python | `.py` | ✅ Full | Relative + absolute imports |
 | Go | `.go` | ✅ Full | Package-based imports |
@@ -13,33 +13,49 @@
 
 ## Symbol Extraction
 
-| Feature | TypeScript | Python |
-|---------|-----------|--------|
-| Functions | ✅ | ✅ |
-| Arrow functions | ✅ | N/A |
-| Classes | ✅ | ✅ |
-| Methods | ✅ | ✅ |
-| Interfaces/Types | ✅ | N/A |
-| Constants | ✅ | ✅ (UPPER_CASE) |
+| Feature | TypeScript | Python | Go | Rust |
+|---------|-----------|--------|-----|------|
+| Functions | ✅ | ✅ | ✅ | ✅ |
+| Arrow functions | ✅ | N/A | N/A | N/A |
+| Classes | ✅ | ✅ | N/A | ✅ (struct) |
+| Methods | ✅ | ✅ | ✅ | ✅ (impl) |
+| Interfaces | ✅ | N/A | ✅ | ✅ (trait) |
+| Types | ✅ | N/A | ✅ | ✅ (enum) |
+| Constants | ✅ | ✅ (UPPER_CASE) | ✅ | ✅ |
+| Modules | N/A | N/A | N/A | ✅ |
+
+## Type Hierarchy (TypeScript)
+
+| Feature | Status |
+|---------|--------|
+| `extends` clause | ✅ Classes and interfaces |
+| `implements` clause | ✅ Classes |
+| Interface methods | ✅ Extracted with parent_type |
+| Class methods | ✅ Extracted with parent_type |
+| Implementor tracking | ✅ build_type_hierarchy() |
+
+This reduces name collision pollution — two unrelated `.render()` methods won't both pollute the cone unless they share a type lineage.
 
 ## Call Graph
 
-| Feature | TypeScript | Python |
-|---------|-----------|--------|
-| Direct calls `fn()` | ✅ | ✅ |
-| Method calls `obj.method()` | ✅ | ✅ |
-| Chained calls | Partial | Partial |
-| Dynamic calls | ❌ | ❌ |
+| Feature | TypeScript | Python | Go | Rust |
+|---------|-----------|--------|-----|------|
+| Direct calls `fn()` | ✅ | ✅ | ✅ | ✅ |
+| Method calls `obj.method()` | ✅ | ✅ | ✅ | ✅ |
+| Selector calls `pkg.Func()` | ✅ | ✅ | ✅ | N/A |
+| Scoped calls `Type::method()` | N/A | N/A | N/A | ✅ |
+| Chained calls | Partial | Partial | Partial | Partial |
+| Dynamic calls | ❌ | ❌ | ❌ | ❌ |
 
 ## Import Resolution
 
-| Feature | TypeScript | Python |
-|---------|-----------|--------|
-| Relative imports | ✅ `./foo` | ✅ `.module` |
-| Absolute imports | ✅ via tsconfig paths | ✅ from project root |
-| Barrel imports | ✅ `index.ts` | ✅ `__init__.py` |
-| Node modules | ❌ (skipped) | ❌ (skipped) |
-| Aliased imports | ✅ tsconfig `paths` | ❌ |
+| Feature | TypeScript | Python | Go | Rust |
+|---------|-----------|--------|-----|------|
+| Relative imports | ✅ `./foo` | ✅ `.module` | N/A | ✅ sibling `.rs` |
+| Absolute imports | ✅ tsconfig paths | ✅ from root | ✅ package path | ✅ from crate root |
+| Barrel imports | ✅ `index.ts` | ✅ `__init__.py` | ✅ package dir | ✅ `mod.rs` |
+| External packages | ❌ (skipped) | ❌ (skipped) | ❌ (skipped) | ❌ (skipped) |
+| Aliased imports | ✅ tsconfig `paths` | ❌ | ❌ | ❌ |
 
 ## Frameworks Tested
 
@@ -52,18 +68,22 @@
 | FastAPI | Python | ✅ |
 | Django | Python | ✅ |
 | Flask | Python | ✅ |
+| Gin | Go | ✅ |
+| Echo | Go | ✅ |
+| Actix-web | Rust | ✅ |
+| Axum | Rust | ✅ |
 
 ## MCP Tools
 
 | Tool | Description |
 |------|-------------|
-| `set_project` | Point at any codebase dynamically |
-| `get_project` | Show current config + graph status |
-| `list_symbols` | Query symbols by file/kind/name |
+| `set_project` | Point at any codebase dynamically (clears graph cache) |
+| `get_project` | Show current config + graph stats |
+| `list_symbols` | Query symbols by file/kind/name substring |
 | `get_cone` | Transitive dependency cone for a symbol |
 | `get_file_context` | Combined cone for all symbols in a file |
-| `validate_change` | Run tsc on proposed code (TS only) |
-| `get_stats` | Session token stats + savings |
+| `validate_change` | Run tsc on proposed code (TypeScript only) |
+| `get_stats` | Session token stats: cone vs full, % saved, cost estimate |
 
 ## Limitations
 
@@ -72,6 +92,25 @@
 - **No runtime analysis**: Only static AST, no execution tracing
 - **No monorepo awareness**: Each `set_project` is a single directory tree
 - **tsc validation**: Only for TypeScript (Python would need pyright/mypy)
+- **Dynamic dispatch**: Includes all implementations of a method name (over-approximates)
+
+## Precision Stack
+
+cone-validate uses a layered approach to balance precision vs soundness:
+
+```
+┌─────────────────────────────────────────────┐
+│ 1. Name-based matching (baseline)           │ ← catches functions, classes
+├─────────────────────────────────────────────┤
+│ 2. Interface→impl narrowing (TypeScript)    │ ← scopes methods to type lineage
+├─────────────────────────────────────────────┤
+│ 3. Call-site type extraction (future)       │ ← "r: Renderer" → only Renderer impls
+├─────────────────────────────────────────────┤
+│ 4. User hints @cone-include (future)        │ ← manual override escape hatch
+└─────────────────────────────────────────────┘
+```
+
+**Trade-off:** Over-approximation is correct for LLM context. Missing a dependency breaks understanding; extra files just cost tokens.
 
 ## Adding a Language
 
@@ -83,4 +122,4 @@
 6. Implement `resolve_<lang>_import()`
 7. Update `build_graph()` to glob new extensions
 
-PRs welcome for Go, Rust, Java.
+See existing implementations for Python, Go, Rust as templates. PRs welcome for Java, C#, C++.
