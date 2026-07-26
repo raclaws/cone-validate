@@ -39,10 +39,21 @@ from mcp.types import Tool, TextContent
 from validate import build_graph, compute_cone
 from config import get_target_dir, get_project_root
 
+# Token counting
+import tiktoken
+_enc = tiktoken.get_encoding("cl100k_base")
+
+def count_tokens(text):
+    """Count tokens in text (handles bytes or str)."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    return len(_enc.encode(text or ""))
+
 # Global state
 _graph_cache = None
 _current_target = None
 _current_project = None
+_token_stats = {"queries": 0, "cone_tokens": 0, "total_tokens": 0}
 
 def get_graph():
     """Lazy-load and cache the dependency graph."""
@@ -186,6 +197,20 @@ async def list_tools():
                 "type": "object",
                 "properties": {}
             }
+        ),
+        Tool(
+            name="get_stats",
+            description="Get cumulative token statistics for this session — total queries, cone tokens served, tokens saved vs full codebase.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "reset": {
+                        "type": "boolean",
+                        "description": "Reset stats after returning (default: false)",
+                        "default": False
+                    }
+                }
+            }
         )
     ]
 
@@ -230,6 +255,26 @@ async def call_tool(name: str, arguments: dict):
             "symbols": len(_graph_cache[0]) if _graph_cache else 0
         }, indent=2))]
     
+    elif name == "get_stats":
+        reset = arguments.get("reset", False)
+        
+        stats = _token_stats.copy()
+        if stats["total_tokens"] > 0:
+            stats["tokens_saved"] = stats["total_tokens"] - stats["cone_tokens"]
+            stats["reduction_pct"] = f"{100 - (stats['cone_tokens'] / stats['total_tokens'] * 100):.1f}%"
+            stats["cost_saved_estimate"] = f"${stats['tokens_saved'] * 3 / 1_000_000:.4f}"  # ~$3/1M input tokens
+        else:
+            stats["tokens_saved"] = 0
+            stats["reduction_pct"] = "N/A"
+            stats["cost_saved_estimate"] = "$0"
+        
+        if reset:
+            _token_stats["queries"] = 0
+            _token_stats["cone_tokens"] = 0
+            _token_stats["total_tokens"] = 0
+        
+        return [TextContent(type="text", text=json.dumps(stats, indent=2))]
+    
     # All other tools need the graph
     symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, all_files, _ = get_graph()
     
@@ -261,11 +306,25 @@ async def call_tool(name: str, arguments: dict):
         
         if include_source:
             result["sources"] = {}
+            source_tokens = 0
             for f in cone_files:
                 src = sources.get(f, b"")
                 if isinstance(src, bytes):
                     src = src.decode("utf-8", errors="replace")
                 result["sources"][f] = src
+                source_tokens += count_tokens(src)
+            
+            # Track stats
+            total_tokens = sum(count_tokens(sources.get(str(f), b"")) for f in all_files)
+            _token_stats["queries"] += 1
+            _token_stats["cone_tokens"] += source_tokens
+            _token_stats["total_tokens"] += total_tokens
+            
+            result["token_stats"] = {
+                "cone_tokens": source_tokens,
+                "total_tokens": total_tokens,
+                "reduction": f"{100 - (source_tokens / total_tokens * 100):.1f}%" if total_tokens else "N/A"
+            }
         
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
     
@@ -300,11 +359,25 @@ async def call_tool(name: str, arguments: dict):
         
         if include_source:
             result["sources"] = {}
+            source_tokens = 0
             for f in combined_cone:
                 src = sources.get(f, b"")
                 if isinstance(src, bytes):
                     src = src.decode("utf-8", errors="replace")
                 result["sources"][f] = src
+                source_tokens += count_tokens(src)
+            
+            # Track stats
+            total_tokens = sum(count_tokens(sources.get(str(f), b"")) for f in all_files)
+            _token_stats["queries"] += 1
+            _token_stats["cone_tokens"] += source_tokens
+            _token_stats["total_tokens"] += total_tokens
+            
+            result["token_stats"] = {
+                "cone_tokens": source_tokens,
+                "total_tokens": total_tokens,
+                "reduction": f"{100 - (source_tokens / total_tokens * 100):.1f}%" if total_tokens else "N/A"
+            }
         
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
     
