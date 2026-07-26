@@ -7,8 +7,8 @@
 | TypeScript | `.ts`, `.tsx` | ✅ Full | JSX/TSX, path aliases via tsconfig |
 | JavaScript | `.js`, `.jsx` | ✅ via TS parser | Same parser handles JS |
 | Python | `.py` | ✅ Full | Relative + absolute imports |
-| Go | `.go` | 🔜 Planned | |
-| Rust | `.rs` | 🔜 Planned | |
+| Go | `.go` | ✅ Full | Package-based imports |
+| Rust | `.rs` | ✅ Full | use/mod, impl methods |
 | Java | `.java` | 🔜 Planned | |
 
 ## Symbol Extraction
