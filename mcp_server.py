@@ -39,16 +39,38 @@ from mcp.types import Tool, TextContent
 from validate import build_graph, compute_cone
 from config import get_target_dir, get_project_root
 
-# Global graph cache
+# Global state
 _graph_cache = None
+_current_target = None
+_current_project = None
 
 def get_graph():
     """Lazy-load and cache the dependency graph."""
-    global _graph_cache
-    if _graph_cache is None:
-        target = Path(get_target_dir())
+    global _graph_cache, _current_target
+    target = Path(get_target_dir())
+    
+    # Rebuild if target changed
+    if _graph_cache is None or _current_target != str(target):
         _graph_cache = build_graph(target)
+        _current_target = str(target)
     return _graph_cache
+
+def set_project(target_dir: str, project_root: str = None):
+    """Change the target project at runtime."""
+    global _graph_cache, _current_target, _current_project
+    import os
+    
+    os.environ["CONE_TARGET_DIR"] = target_dir
+    if project_root:
+        os.environ["CONE_PROJECT_ROOT"] = project_root
+    else:
+        # Default project_root to parent of target_dir
+        os.environ["CONE_PROJECT_ROOT"] = str(Path(target_dir).parent)
+    
+    # Clear cache to force rebuild
+    _graph_cache = None
+    _current_target = None
+    _current_project = project_root or str(Path(target_dir).parent)
 
 # Create MCP server
 server = Server("cone-validate")
@@ -131,6 +153,32 @@ async def list_tools():
                     }
                 },
                 "required": ["file", "content"]
+            }
+        ),
+        Tool(
+            name="set_project",
+            description="Change the target TypeScript project at runtime. Clears the graph cache and rebuilds on next tool call. Use this to switch between projects without restarting.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "target_dir": {
+                        "type": "string",
+                        "description": "Path to the source directory (e.g., /path/to/project/src)"
+                    },
+                    "project_root": {
+                        "type": "string",
+                        "description": "Path to the project root with tsconfig.json (default: parent of target_dir)"
+                    }
+                },
+                "required": ["target_dir"]
+            }
+        ),
+        Tool(
+            name="get_project",
+            description="Get the current project configuration (target_dir and project_root).",
+            inputSchema={
+                "type": "object",
+                "properties": {}
             }
         )
     ]
@@ -280,6 +328,44 @@ async def call_tool(name: str, arguments: dict):
                 full_path.write_text(original)
             elif full_path.exists():
                 full_path.unlink()
+    
+    elif name == "set_project":
+        target_dir = arguments["target_dir"]
+        project_root = arguments.get("project_root")
+        
+        # Validate path exists
+        if not Path(target_dir).exists():
+            return [TextContent(type="text", text=json.dumps({
+                "error": f"Target directory does not exist: {target_dir}"
+            }))]
+        
+        set_project(target_dir, project_root)
+        
+        return [TextContent(type="text", text=json.dumps({
+            "success": True,
+            "target_dir": target_dir,
+            "project_root": project_root or str(Path(target_dir).parent),
+            "message": "Project changed. Graph will rebuild on next tool call."
+        }, indent=2))]
+    
+    elif name == "get_project":
+        import os
+        target = os.environ.get("CONE_TARGET_DIR")
+        project = os.environ.get("CONE_PROJECT_ROOT")
+        
+        if not target:
+            return [TextContent(type="text", text=json.dumps({
+                "configured": False,
+                "error": "No project configured. Use set_project to configure."
+            }))]
+        
+        return [TextContent(type="text", text=json.dumps({
+            "configured": True,
+            "target_dir": target,
+            "project_root": project or str(Path(target).parent),
+            "graph_loaded": _graph_cache is not None,
+            "symbols": len(_graph_cache[0]) if _graph_cache else 0
+        }, indent=2))]
     
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
