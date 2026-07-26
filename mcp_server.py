@@ -47,7 +47,13 @@ _current_project = None
 def get_graph():
     """Lazy-load and cache the dependency graph."""
     global _graph_cache, _current_target
-    target = Path(get_target_dir())
+    import os
+    
+    # Read directly from env to avoid config module caching
+    target_dir = os.environ.get("CONE_TARGET_DIR")
+    if not target_dir:
+        raise ValueError("CONE_TARGET_DIR not set")
+    target = Path(target_dir)
     
     # Rebuild if target changed
     if _graph_cache is None or _current_target != str(target):
