@@ -275,7 +275,9 @@ async def call_tool(name: str, arguments: dict):
         
         # Normalize path
         if file_path.startswith("/"):
-            file_path = str(Path(file_path).relative_to(get_target_dir()))
+            import os
+            target_dir = os.environ.get("CONE_TARGET_DIR", "")
+            file_path = str(Path(file_path).relative_to(target_dir))
         
         if file_path not in sym_by_file:
             return [TextContent(type="text", text=f"File '{file_path}' not found or has no symbols")]
@@ -329,15 +331,23 @@ async def call_tool(name: str, arguments: dict):
     
     elif name == "validate_change":
         import subprocess
-        import tempfile
+        import os
         
         file_path = arguments["file"]
         content = arguments["content"]
-        project_root = get_project_root()
+        
+        # Read from env directly
+        project_root = os.environ.get("CONE_PROJECT_ROOT")
+        target_dir = os.environ.get("CONE_TARGET_DIR")
+        
+        if not project_root or not target_dir:
+            return [TextContent(type="text", text=json.dumps({
+                "error": "No project configured. Use set_project first."
+            }))]
         
         # Resolve full path
         if not file_path.startswith("/"):
-            full_path = Path(get_target_dir()) / file_path
+            full_path = Path(target_dir) / file_path
         else:
             full_path = Path(file_path)
         
