@@ -14,11 +14,25 @@ from collections import defaultdict, deque
 import tiktoken
 from tree_sitter import Language, Parser
 import tree_sitter_typescript as ts_typescript
+import tree_sitter_python as ts_python
 
 # ── Setup ────────────────────────────────────────────────────────────────────
 TS_LANGUAGE = Language(ts_typescript.language_typescript())
-parser = Parser(TS_LANGUAGE)
+PY_LANGUAGE = Language(ts_python.language())
+
+ts_parser = Parser(TS_LANGUAGE)
+py_parser = Parser(PY_LANGUAGE)
+
 enc = tiktoken.get_encoding("cl100k_base")
+
+def get_parser_for_file(path: Path):
+    """Return appropriate parser and language for file extension."""
+    ext = path.suffix.lower()
+    if ext in ('.ts', '.tsx'):
+        return ts_parser, 'typescript'
+    elif ext == '.py':
+        return py_parser, 'python'
+    return None, None
 
 TARGET_DIR = Path("/root/repos/twenty-dollar/frontend/src/lib")  # Legacy default, use config
 
@@ -28,12 +42,23 @@ def tokens(text: str) -> int:
 
 # ── AST extraction ───────────────────────────────────────────────────────────
 def parse_file(path: Path):
+    """Parse a file with the appropriate language parser."""
     src = path.read_bytes()
-    return src, parser.parse(src)
+    parser, lang = get_parser_for_file(path)
+    if parser is None:
+        return src, None, None
+    return src, parser.parse(src), lang
 
 
-def extract_symbols(src: bytes, tree, file_str: str) -> list[dict]:
+def extract_symbols(src: bytes, tree, file_str: str, lang: str = 'typescript') -> list[dict]:
     """Return function/class/arrow declarations with byte spans."""
+    if tree is None:
+        return []
+    
+    if lang == 'python':
+        return extract_symbols_python(src, tree, file_str)
+    
+    # TypeScript extraction (existing code)
     out = []
 
     def first_ident(node) -> str | None:
@@ -77,9 +102,62 @@ def extract_symbols(src: bytes, tree, file_str: str) -> list[dict]:
     return out
 
 
-def extract_calls(src: bytes, tree) -> set[str]:
+def extract_symbols_python(src: bytes, tree, file_str: str) -> list[dict]:
+    """Extract symbols from Python AST."""
+    out = []
+    
+    def get_name(node) -> str | None:
+        for c in node.children:
+            if c.type == "identifier":
+                return src[c.start_byte:c.end_byte].decode("utf-8", errors="replace")
+        return None
+    
+    def walk(node, parent=None):
+        t = node.type
+        if t == "function_definition":
+            name = get_name(node)
+            if name:
+                full_name = f"{parent}.{name}" if parent else name
+                out.append(dict(name=full_name, file=file_str, kind="function",
+                                start=node.start_byte, end=node.end_byte))
+        elif t == "class_definition":
+            name = get_name(node)
+            if name:
+                out.append(dict(name=name, file=file_str, kind="class",
+                                start=node.start_byte, end=node.end_byte))
+                # Walk class body for methods
+                for c in node.children:
+                    if c.type == "block":
+                        for stmt in c.children:
+                            walk(stmt, parent=name)
+                return
+        elif t == "assignment" and parent is None:
+            # Top-level variable assignment
+            for c in node.children:
+                if c.type == "identifier":
+                    name = src[c.start_byte:c.end_byte].decode("utf-8", errors="replace")
+                    if name.isupper():  # Constants
+                        out.append(dict(name=name, file=file_str, kind="constant",
+                                        start=node.start_byte, end=node.end_byte))
+                    break
+        for c in node.children:
+            walk(c, parent)
+    
+    walk(tree.root_node)
+    return out
+
+
+def extract_calls(src: bytes, tree, lang: str = 'typescript') -> set[str]:
     """Called identifiers within this file (simple + member.prop)."""
+    if tree is None:
+        return set()
+    
     calls = set()
+    
+    if lang == 'python':
+        return extract_calls_python(src, tree)
+
+    # TypeScript extraction (existing)
 
     def walk(node):
         if node.type == "call_expression":
@@ -98,8 +176,37 @@ def extract_calls(src: bytes, tree) -> set[str]:
     return calls
 
 
-def extract_imports(src: bytes, tree) -> list[str]:
+def extract_calls_python(src: bytes, tree) -> set[str]:
+    """Extract called identifiers from Python AST."""
+    calls = set()
+    
+    def walk(node):
+        if node.type == "call":
+            fn = node.child_by_field_name("function")
+            if fn:
+                if fn.type == "identifier":
+                    calls.add(src[fn.start_byte:fn.end_byte].decode("utf-8", errors="replace"))
+                elif fn.type == "attribute":
+                    # obj.method() -> extract method name
+                    attr = fn.child_by_field_name("attribute")
+                    if attr:
+                        calls.add(src[attr.start_byte:attr.end_byte].decode("utf-8", errors="replace"))
+        for c in node.children:
+            walk(c)
+    
+    walk(tree.root_node)
+    return calls
+
+
+def extract_imports(src: bytes, tree, lang: str = 'typescript') -> list[str]:
     """All import paths referenced by this file (relative and aliased)."""
+    if tree is None:
+        return []
+    
+    if lang == 'python':
+        return extract_imports_python(src, tree)
+    
+    # TypeScript extraction (existing)
     imps = []
 
     def walk(node):
@@ -115,6 +222,60 @@ def extract_imports(src: bytes, tree) -> list[str]:
 
     walk(tree.root_node)
     return imps
+
+
+def extract_imports_python(src: bytes, tree) -> list[str]:
+    """Extract import paths from Python AST."""
+    imps = []
+    
+    def walk(node):
+        if node.type == "import_statement":
+            # import foo, bar
+            for c in node.children:
+                if c.type == "dotted_name":
+                    name = src[c.start_byte:c.end_byte].decode("utf-8", errors="replace")
+                    imps.append(name)
+        elif node.type == "import_from_statement":
+            # from foo import bar
+            module = node.child_by_field_name("module_name")
+            if module:
+                name = src[module.start_byte:module.end_byte].decode("utf-8", errors="replace")
+                imps.append(name)
+        for c in node.children:
+            walk(c)
+    
+    walk(tree.root_node)
+    return imps
+
+
+def resolve_python_import(imp: str, current_file: Path, target_dir: Path) -> str | None:
+    """Resolve a Python import to a repo-relative file path."""
+    # Handle relative imports (leading dots)
+    if imp.startswith("."):
+        dots = len(imp) - len(imp.lstrip("."))
+        rest = imp[dots:]
+        base = current_file.parent
+        for _ in range(dots - 1):
+            base = base.parent
+        if rest:
+            parts = rest.split(".")
+            candidate = base / "/".join(parts)
+        else:
+            candidate = base
+    else:
+        # Absolute import - try as path from target_dir
+        parts = imp.split(".")
+        candidate = target_dir / "/".join(parts)
+    
+    # Try .py extension and __init__.py for packages
+    for suffix in [".py", "/__init__.py"]:
+        path = Path(str(candidate) + suffix)
+        if path.exists():
+            try:
+                return str(path.relative_to(target_dir))
+            except ValueError:
+                pass
+    return None
 
 
 # ── Graph build ───────────────────────────────────────────────────────────────
@@ -182,7 +343,7 @@ def resolve_import(imp: str, current_file: Path, target_dir: Path,
 
 
 def build_graph(target_dir: Path):
-    """Parse all .ts files; return (symbols dict, call edges, import edges)."""
+    """Parse all .ts/.tsx/.py files; return (symbols dict, call edges, import edges)."""
     symbols: dict[str, dict] = {}        # name → symbol record
     sym_by_file: dict[str, list] = defaultdict(list)
     call_edges: dict[str, set] = defaultdict(set)   # caller_file → {called_name}
@@ -190,40 +351,50 @@ def build_graph(target_dir: Path):
     sources: dict[str, bytes] = {}
 
     aliases = load_path_aliases(target_dir)
+    
+    # Collect all supported files
     ts_files = list(target_dir.rglob("*.ts")) + list(target_dir.rglob("*.tsx"))
+    py_files = list(target_dir.rglob("*.py"))
+    all_source_files = ts_files + py_files
+    
     parse_errors = 0
     unresolved_imports = 0
 
-    for path in ts_files:
+    for path in all_source_files:
         rel = str(path.relative_to(target_dir))
         try:
-            src, tree = parse_file(path)
+            src, tree, lang = parse_file(path)
+            if tree is None:
+                parse_errors += 1
+                continue
         except Exception as e:
             parse_errors += 1
             continue
 
         sources[rel] = src
-        syms = extract_symbols(src, tree, rel)
+        syms = extract_symbols(src, tree, rel, lang)
         for s in syms:
             symbols[s["name"]] = s
             sym_by_file[rel].append(s["name"])
 
-        calls = extract_calls(src, tree)
+        calls = extract_calls(src, tree, lang)
         call_edges[rel] = calls
 
-        raw_imps = extract_imports(src, tree)
+        raw_imps = extract_imports(src, tree, lang)
         resolved = []
         for imp in raw_imps:
-            r = resolve_import(imp, path, target_dir, aliases)
+            if lang == 'python':
+                r = resolve_python_import(imp, path, target_dir)
+            else:
+                r = resolve_import(imp, path, target_dir, aliases)
             if r:
                 resolved.append(r)
             else:
                 unresolved_imports += 1
-                # fall back to call-edge layer — don't drop, just skip import edge
         import_edges[rel] = resolved
 
     call_file_edges = build_call_file_edges(call_edges, symbols)
-    return symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, ts_files, parse_errors
+    return symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, all_source_files, parse_errors
 
 
 # ── Cone computation ─────────────────────────────────────────────────────────
