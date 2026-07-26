@@ -18,13 +18,15 @@ cone-validate computes the **transitive closure** of dependencies for any symbol
 
 ## Languages Supported
 
-| Language | Extensions | Status |
-|----------|-----------|--------|
-| TypeScript | `.ts`, `.tsx` | ✅ Full (path aliases, type hierarchy) |
-| JavaScript | `.js`, `.jsx` | ✅ via TS parser |
-| Python | `.py` | ✅ Full |
-| Go | `.go` | ✅ Full |
-| Rust | `.rs` | ✅ Full |
+| Language | Extensions | Implemented | Validated |
+|----------|-----------|-------------|-----------|
+| TypeScript | `.ts`, `.tsx` | ✅ Full (path aliases, type hierarchy) | ✅ twenty-dollar (61 files) |
+| JavaScript | `.js`, `.jsx` | ✅ via TS parser | ❌ Not yet |
+| Python | `.py` | ✅ Full | ⚠️ Parsing only (cone-validate itself) |
+| Go | `.go` | ✅ Full | ❌ Not yet |
+| Rust | `.rs` | ✅ Full | ⚠️ Parsing only (CodeRLM, 34 files) |
+
+**Implemented** = parser works, symbols/calls/imports extracted. **Validated** = tested on a real codebase with cone computation and correctness verification.
 
 ## Quick Start
 
@@ -102,15 +104,18 @@ Add to your MCP client config (Claude Code, Cline, Continue, Hermes):
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Results
+## Validated Results
 
-Tested on real codebases:
+Tested on **twenty-dollar** (TypeScript, 61 files):
 
-| Metric | Value |
-|--------|-------|
-| Average cone size | 14% of repo |
-| Token reduction | 86% average, 97.8% for leaf symbols |
-| Parse errors | 0 (across TS, Python, Go, Rust) |
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Average cone size | 14% of repo | Across sampled symbols |
+| Token reduction | 86% average | Cone vs full codebase |
+| Two-agent delta handoff | 97.8% savings | 4,217 tokens vs 189,832 full-context baseline |
+| Parse errors | 0 | |
+
+The 97.8% figure is specifically for **multi-agent coordination** — Agent A edits a symbol (690 tok), Agent B receives delta + its own file (3,527 tok), vs both agents loading full context twice. It's a protocol savings number, not a cone-size metric.
 
 ## Example: Subagent Vibe Coding
 
@@ -142,6 +147,21 @@ cone-validate uses **static analysis** (not runtime tracing):
 - No cross-language cones (Python importing TS won't resolve)
 
 **Trade-off:** Over-approximation is correct for LLM context. Missing a dependency breaks understanding; extra files just cost tokens.
+
+## Known Gaps
+
+Honest accounting of what's not yet solved:
+
+| Gap | Impact | Status |
+|-----|--------|--------|
+| **Path alias resolution** | Tilde aliases (`~/lib/...`) not followed in import edges. Call-edge layer compensates but some imports are missed. | Partial workaround |
+| **Scope declaration** | Agents don't emit a symbol manifest during generation; subscription is inferred from query history. Acceptable for prototype, needs explicit contract for production. | Not addressed |
+| **Test coverage as oracle** | Correctness of agent answers was manually assessed, not verified by a test suite. | Not addressed |
+| **Subscription inference** | Delta routing relies on which files agents queried, not explicit "I'm working on X" declarations. Brittle for multi-agent coordination. | Not addressed |
+| **tsc validation only** | `validate_change` only works for TypeScript. Python would need pyright/mypy integration. | Not addressed |
+| **Monorepo support** | Each `set_project` is a single directory tree. Cross-package imports in monorepos won't resolve. | Not addressed |
+
+If you're integrating cone-validate into a production system, these are the places where you'll need to add your own handling or accept the limitations.
 
 ## Type Hierarchy (TypeScript)
 

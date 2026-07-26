@@ -2,14 +2,17 @@
 
 ## Languages
 
-| Language | Extensions | Status | Notes |
-|----------|-----------|--------|-------|
-| TypeScript | `.ts`, `.tsx` | ✅ Full | JSX/TSX, path aliases via tsconfig, type hierarchy |
-| JavaScript | `.js`, `.jsx` | ✅ via TS parser | Same parser handles JS |
-| Python | `.py` | ✅ Full | Relative + absolute imports |
-| Go | `.go` | ✅ Full | Package-based imports |
-| Rust | `.rs` | ✅ Full | use/mod, impl methods |
-| Java | `.java` | 🔜 Planned | |
+| Language | Extensions | Implemented | Validated |
+|----------|-----------|-------------|-----------|
+| TypeScript | `.ts`, `.tsx` | ✅ Full (path aliases, type hierarchy) | ✅ twenty-dollar (61 files) |
+| JavaScript | `.js`, `.jsx` | ✅ via TS parser | ❌ Not yet |
+| Python | `.py` | ✅ Full | ⚠️ Parsing only (cone-validate itself) |
+| Go | `.go` | ✅ Full | ❌ Not yet |
+| Rust | `.rs` | ✅ Full | ⚠️ Parsing only (CodeRLM, 34 files) |
+| Java | `.java` | 🔜 Planned | — |
+
+**Implemented** = parser works, symbols/calls/imports extracted.  
+**Validated** = tested on a real codebase with cone computation and correctness verification.
 
 ## Symbol Extraction
 
