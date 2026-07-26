@@ -15,13 +15,19 @@ import tiktoken
 from tree_sitter import Language, Parser
 import tree_sitter_typescript as ts_typescript
 import tree_sitter_python as ts_python
+import tree_sitter_go as ts_go
+import tree_sitter_rust as ts_rust
 
 # ── Setup ────────────────────────────────────────────────────────────────────
 TS_LANGUAGE = Language(ts_typescript.language_typescript())
 PY_LANGUAGE = Language(ts_python.language())
+GO_LANGUAGE = Language(ts_go.language())
+RS_LANGUAGE = Language(ts_rust.language())
 
 ts_parser = Parser(TS_LANGUAGE)
 py_parser = Parser(PY_LANGUAGE)
+go_parser = Parser(GO_LANGUAGE)
+rs_parser = Parser(RS_LANGUAGE)
 
 enc = tiktoken.get_encoding("cl100k_base")
 
@@ -32,6 +38,10 @@ def get_parser_for_file(path: Path):
         return ts_parser, 'typescript'
     elif ext == '.py':
         return py_parser, 'python'
+    elif ext == '.go':
+        return go_parser, 'go'
+    elif ext == '.rs':
+        return rs_parser, 'rust'
     return None, None
 
 TARGET_DIR = Path("/root/repos/twenty-dollar/frontend/src/lib")  # Legacy default, use config
@@ -57,6 +67,10 @@ def extract_symbols(src: bytes, tree, file_str: str, lang: str = 'typescript') -
     
     if lang == 'python':
         return extract_symbols_python(src, tree, file_str)
+    elif lang == 'go':
+        return extract_symbols_go(src, tree, file_str)
+    elif lang == 'rust':
+        return extract_symbols_rust(src, tree, file_str)
     
     # TypeScript extraction (existing code)
     out = []
@@ -147,6 +161,139 @@ def extract_symbols_python(src: bytes, tree, file_str: str) -> list[dict]:
     return out
 
 
+def extract_symbols_go(src: bytes, tree, file_str: str) -> list[dict]:
+    """Extract symbols from Go AST."""
+    out = []
+    
+    def get_name(node) -> str | None:
+        for c in node.children:
+            if c.type == "identifier":
+                return src[c.start_byte:c.end_byte].decode("utf-8", errors="replace")
+        return None
+    
+    def walk(node):
+        t = node.type
+        if t == "function_declaration":
+            name = get_name(node)
+            if name:
+                out.append(dict(name=name, file=file_str, kind="function",
+                                start=node.start_byte, end=node.end_byte))
+        elif t == "method_declaration":
+            # func (r Receiver) Method()
+            name = None
+            receiver = None
+            for c in node.children:
+                if c.type == "parameter_list" and receiver is None:
+                    # First param list is receiver
+                    for p in c.children:
+                        if p.type == "parameter_declaration":
+                            for t in p.children:
+                                if t.type == "type_identifier" or t.type == "pointer_type":
+                                    receiver = src[t.start_byte:t.end_byte].decode("utf-8", errors="replace").strip("*")
+                elif c.type == "field_identifier":
+                    name = src[c.start_byte:c.end_byte].decode("utf-8", errors="replace")
+            if name:
+                full_name = f"{receiver}.{name}" if receiver else name
+                out.append(dict(name=full_name, file=file_str, kind="method",
+                                start=node.start_byte, end=node.end_byte))
+        elif t == "type_declaration":
+            for c in node.children:
+                if c.type == "type_spec":
+                    name = get_name(c)
+                    kind = "type"
+                    for sub in c.children:
+                        if sub.type == "struct_type":
+                            kind = "struct"
+                        elif sub.type == "interface_type":
+                            kind = "interface"
+                    if name:
+                        out.append(dict(name=name, file=file_str, kind=kind,
+                                        start=node.start_byte, end=node.end_byte))
+        elif t == "const_declaration" or t == "var_declaration":
+            for c in node.children:
+                if c.type == "const_spec" or c.type == "var_spec":
+                    name = get_name(c)
+                    if name:
+                        out.append(dict(name=name, file=file_str, 
+                                        kind="constant" if t == "const_declaration" else "variable",
+                                        start=node.start_byte, end=node.end_byte))
+        for c in node.children:
+            walk(c)
+    
+    walk(tree.root_node)
+    return out
+
+
+def extract_symbols_rust(src: bytes, tree, file_str: str) -> list[dict]:
+    """Extract symbols from Rust AST."""
+    out = []
+    
+    def get_name(node) -> str | None:
+        for c in node.children:
+            if c.type == "identifier" or c.type == "type_identifier":
+                return src[c.start_byte:c.end_byte].decode("utf-8", errors="replace")
+        return None
+    
+    def walk(node, impl_target=None):
+        t = node.type
+        if t == "function_item":
+            name = get_name(node)
+            if name:
+                full_name = f"{impl_target}.{name}" if impl_target else name
+                out.append(dict(name=full_name, file=file_str, kind="function",
+                                start=node.start_byte, end=node.end_byte))
+        elif t == "struct_item":
+            name = get_name(node)
+            if name:
+                out.append(dict(name=name, file=file_str, kind="struct",
+                                start=node.start_byte, end=node.end_byte))
+        elif t == "enum_item":
+            name = get_name(node)
+            if name:
+                out.append(dict(name=name, file=file_str, kind="enum",
+                                start=node.start_byte, end=node.end_byte))
+        elif t == "trait_item":
+            name = get_name(node)
+            if name:
+                out.append(dict(name=name, file=file_str, kind="trait",
+                                start=node.start_byte, end=node.end_byte))
+        elif t == "impl_item":
+            # impl Type { ... } or impl Trait for Type { ... }
+            target = None
+            for c in node.children:
+                if c.type == "type_identifier":
+                    target = src[c.start_byte:c.end_byte].decode("utf-8", errors="replace")
+                    break
+                elif c.type == "generic_type":
+                    target = get_name(c)
+                    break
+            for c in node.children:
+                if c.type == "declaration_list":
+                    for item in c.children:
+                        walk(item, impl_target=target)
+            return
+        elif t == "const_item":
+            name = get_name(node)
+            if name:
+                out.append(dict(name=name, file=file_str, kind="constant",
+                                start=node.start_byte, end=node.end_byte))
+        elif t == "static_item":
+            name = get_name(node)
+            if name:
+                out.append(dict(name=name, file=file_str, kind="static",
+                                start=node.start_byte, end=node.end_byte))
+        elif t == "mod_item":
+            name = get_name(node)
+            if name:
+                out.append(dict(name=name, file=file_str, kind="module",
+                                start=node.start_byte, end=node.end_byte))
+        for c in node.children:
+            walk(c, impl_target)
+    
+    walk(tree.root_node)
+    return out
+
+
 def extract_calls(src: bytes, tree, lang: str = 'typescript') -> set[str]:
     """Called identifiers within this file (simple + member.prop)."""
     if tree is None:
@@ -156,6 +303,10 @@ def extract_calls(src: bytes, tree, lang: str = 'typescript') -> set[str]:
     
     if lang == 'python':
         return extract_calls_python(src, tree)
+    elif lang == 'go':
+        return extract_calls_go(src, tree)
+    elif lang == 'rust':
+        return extract_calls_rust(src, tree)
 
     # TypeScript extraction (existing)
 
@@ -198,6 +349,55 @@ def extract_calls_python(src: bytes, tree) -> set[str]:
     return calls
 
 
+def extract_calls_go(src: bytes, tree) -> set[str]:
+    """Extract called identifiers from Go AST."""
+    calls = set()
+    
+    def walk(node):
+        if node.type == "call_expression":
+            fn = node.child_by_field_name("function")
+            if fn:
+                if fn.type == "identifier":
+                    calls.add(src[fn.start_byte:fn.end_byte].decode("utf-8", errors="replace"))
+                elif fn.type == "selector_expression":
+                    # pkg.Func() or obj.Method()
+                    field = fn.child_by_field_name("field")
+                    if field:
+                        calls.add(src[field.start_byte:field.end_byte].decode("utf-8", errors="replace"))
+        for c in node.children:
+            walk(c)
+    
+    walk(tree.root_node)
+    return calls
+
+
+def extract_calls_rust(src: bytes, tree) -> set[str]:
+    """Extract called identifiers from Rust AST."""
+    calls = set()
+    
+    def walk(node):
+        if node.type == "call_expression":
+            fn = node.child_by_field_name("function")
+            if fn:
+                if fn.type == "identifier":
+                    calls.add(src[fn.start_byte:fn.end_byte].decode("utf-8", errors="replace"))
+                elif fn.type == "field_expression":
+                    # obj.method()
+                    field = fn.child_by_field_name("field")
+                    if field:
+                        calls.add(src[field.start_byte:field.end_byte].decode("utf-8", errors="replace"))
+                elif fn.type == "scoped_identifier":
+                    # Type::method() or module::func()
+                    name = fn.child_by_field_name("name")
+                    if name:
+                        calls.add(src[name.start_byte:name.end_byte].decode("utf-8", errors="replace"))
+        for c in node.children:
+            walk(c)
+    
+    walk(tree.root_node)
+    return calls
+
+
 def extract_imports(src: bytes, tree, lang: str = 'typescript') -> list[str]:
     """All import paths referenced by this file (relative and aliased)."""
     if tree is None:
@@ -205,6 +405,10 @@ def extract_imports(src: bytes, tree, lang: str = 'typescript') -> list[str]:
     
     if lang == 'python':
         return extract_imports_python(src, tree)
+    elif lang == 'go':
+        return extract_imports_go(src, tree)
+    elif lang == 'rust':
+        return extract_imports_rust(src, tree)
     
     # TypeScript extraction (existing)
     imps = []
@@ -273,6 +477,92 @@ def resolve_python_import(imp: str, current_file: Path, target_dir: Path) -> str
         if path.exists():
             try:
                 return str(path.relative_to(target_dir))
+            except ValueError:
+                pass
+    return None
+
+
+def extract_imports_go(src: bytes, tree) -> list[str]:
+    """Extract import paths from Go AST."""
+    imps = []
+    
+    def walk(node):
+        if node.type == "import_declaration":
+            for c in node.children:
+                if c.type == "import_spec":
+                    for s in c.children:
+                        if s.type == "interpreted_string_literal":
+                            path = src[s.start_byte:s.end_byte].decode("utf-8", errors="replace").strip('"')
+                            imps.append(path)
+                elif c.type == "import_spec_list":
+                    for spec in c.children:
+                        if spec.type == "import_spec":
+                            for s in spec.children:
+                                if s.type == "interpreted_string_literal":
+                                    path = src[s.start_byte:s.end_byte].decode("utf-8", errors="replace").strip('"')
+                                    imps.append(path)
+        for c in node.children:
+            walk(c)
+    
+    walk(tree.root_node)
+    return imps
+
+
+def extract_imports_rust(src: bytes, tree) -> list[str]:
+    """Extract use/mod paths from Rust AST."""
+    imps = []
+    
+    def walk(node):
+        if node.type == "use_declaration":
+            for c in node.children:
+                if c.type in ("scoped_identifier", "use_as_clause", "scoped_use_list", "identifier"):
+                    path = src[c.start_byte:c.end_byte].decode("utf-8", errors="replace")
+                    if "::" in path:
+                        base = path.split("::")[0]
+                        if base not in ("self", "super", "crate"):
+                            imps.append(base)
+                    elif path not in ("self", "super", "crate"):
+                        imps.append(path)
+        elif node.type == "mod_item":
+            has_body = any(c.type == "declaration_list" for c in node.children)
+            if not has_body:
+                for c in node.children:
+                    if c.type == "identifier":
+                        imps.append(src[c.start_byte:c.end_byte].decode("utf-8", errors="replace"))
+        for c in node.children:
+            walk(c)
+    
+    walk(tree.root_node)
+    return imps
+
+
+def resolve_go_import(imp: str, current_file: Path, target_dir: Path) -> str | None:
+    """Resolve a Go import to a repo-relative file path."""
+    parts = imp.split("/")
+    for i in range(len(parts)):
+        subpath = "/".join(parts[i:])
+        candidate = target_dir / subpath
+        if candidate.is_dir():
+            go_files = list(candidate.glob("*.go"))
+            if go_files:
+                try:
+                    return str(go_files[0].relative_to(target_dir))
+                except ValueError:
+                    pass
+    return None
+
+
+def resolve_rust_import(imp: str, current_file: Path, target_dir: Path) -> str | None:
+    """Resolve a Rust use/mod to a repo-relative file path."""
+    for candidate in [
+        current_file.parent / f"{imp}.rs",
+        current_file.parent / imp / "mod.rs",
+        target_dir / f"{imp}.rs",
+        target_dir / imp / "mod.rs",
+    ]:
+        if candidate.exists():
+            try:
+                return str(candidate.relative_to(target_dir))
             except ValueError:
                 pass
     return None
@@ -355,7 +645,9 @@ def build_graph(target_dir: Path):
     # Collect all supported files
     ts_files = list(target_dir.rglob("*.ts")) + list(target_dir.rglob("*.tsx"))
     py_files = list(target_dir.rglob("*.py"))
-    all_source_files = ts_files + py_files
+    go_files = list(target_dir.rglob("*.go"))
+    rs_files = list(target_dir.rglob("*.rs"))
+    all_source_files = ts_files + py_files + go_files + rs_files
     
     parse_errors = 0
     unresolved_imports = 0
@@ -385,6 +677,10 @@ def build_graph(target_dir: Path):
         for imp in raw_imps:
             if lang == 'python':
                 r = resolve_python_import(imp, path, target_dir)
+            elif lang == 'go':
+                r = resolve_go_import(imp, path, target_dir)
+            elif lang == 'rust':
+                r = resolve_rust_import(imp, path, target_dir)
             else:
                 r = resolve_import(imp, path, target_dir, aliases)
             if r:
