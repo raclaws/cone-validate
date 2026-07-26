@@ -25,13 +25,19 @@ from validate import build_graph, compute_cone
 from single_agent_test import build_context
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TARGET_DIR   = Path("/root/repos/twenty-dollar/frontend/src")
-PROJECT_ROOT = Path("/root/repos/twenty-dollar/frontend")
-GATEWAY_URL  = "https://gateway.ai.cloudflare.com/v1/66bc302ceeffd5db7f4e1c191467acd8/default1/custom-deadog/v1/chat/completions"
-API_KEY = os.environ.get("GATEWAY_API_KEY", "")
-MODEL_CHEAP  = "claude-haiku-4.5"
-MODEL_STRONG = "kr/claude-sonnet-4.6"
-MAX_RETRIES  = 3
+from config import (
+    get_target_dir, get_project_root, get_gateway_url, get_api_key,
+    get_model_cheap, get_model_strong, get_max_retries,
+)
+
+# Re-export config getters for backward compatibility with other scripts
+TARGET_DIR = get_target_dir
+PROJECT_ROOT = get_project_root
+GATEWAY_URL = get_gateway_url
+API_KEY = get_api_key
+MODEL_CHEAP = get_model_cheap
+MODEL_STRONG = get_model_strong
+MAX_RETRIES = get_max_retries
 
 enc = tiktoken.get_encoding("cl100k_base")
 
@@ -46,9 +52,9 @@ def llm(prompt: str, model: str, label: str) -> dict:
         "model": model, "max_tokens": 2048, "stream": False,
         "messages": [{"role": "user", "content": prompt}],
     }
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {get_api_key()}", "Content-Type": "application/json"}
     t0 = time.time()
-    resp = requests.post(GATEWAY_URL, json=payload, headers=headers, timeout=120)
+    resp = requests.post(get_gateway_url(), json=payload, headers=headers, timeout=120)
     latency = round(time.time() - t0, 2)
 
     if resp.status_code != 200:
@@ -223,7 +229,7 @@ OUTPUT RULES:
 def oracle_loop(symbols, sym_by_file, call_file_edges, import_edges, sources):
     target_sym  = "createBudgetStore"
     origin_file = symbols[target_sym]["file"]  # lib/budget-signals.ts
-    origin_path = TARGET_DIR / origin_file
+    origin_path = get_target_dir() / origin_file
     origin_src  = sources[origin_file].decode("utf-8", errors="replace")
 
     cone_files = compute_cone(target_sym, symbols, sym_by_file, call_file_edges, import_edges)
@@ -231,25 +237,25 @@ def oracle_loop(symbols, sym_by_file, call_file_edges, import_edges, sources):
 
     # baseline tsc errors (pre-existing, filter out before loop)
     print("Running baseline tsc check ...")
-    baseline_errors = run_tsc(PROJECT_ROOT)
+    baseline_errors = run_tsc(get_project_root())
     baseline_keys   = {make_baseline_key(e) for e in baseline_errors}
     print(f"  Baseline errors: {len(baseline_errors)}")
 
     log = []
     current_code = origin_src
-    model = MODEL_CHEAP
+    model = get_model_cheap()
     last_errors = []
 
-    for attempt in range(1, MAX_RETRIES + 2):  # +1 for escalation slot
-        is_escalation = attempt > MAX_RETRIES
+    for attempt in range(1, get_max_retries() + 2):  # +1 for escalation slot
+        is_escalation = attempt > get_max_retries()
 
         if attempt == 1:
             prompt = WRITE_PROMPT + origin_src
             label  = f"ATTEMPT {attempt} (write)"
         elif is_escalation:
             prompt = escalation_prompt(origin_src, cone_ctx, format_errors(last_errors))
-            model  = MODEL_STRONG
-            label  = f"ESCALATION (clean room, {MODEL_STRONG})"
+            model  = get_model_strong()
+            label  = f"ESCALATION (clean room, {get_model_strong()})"
         else:
             prompt = retry_prompt(origin_src, current_code, format_errors(last_errors), attempt)
             label  = f"ATTEMPT {attempt} (retry)"
@@ -277,7 +283,7 @@ def oracle_loop(symbols, sym_by_file, call_file_edges, import_edges, sources):
         backup = origin_path.read_bytes()
         try:
             origin_path.write_text(new_code)
-            all_errors  = run_tsc(PROJECT_ROOT)
+            all_errors  = run_tsc(get_project_root())
             # subtract baseline — match by (file, code, message), not line number
             new_errors  = [e for e in all_errors
                            if make_baseline_key(e) not in baseline_keys]
@@ -286,7 +292,7 @@ def oracle_loop(symbols, sym_by_file, call_file_edges, import_edges, sources):
             # Only escalate to full cone errors if changed file is clean.
             changed_errors = [e for e in new_errors
                               if origin_file in e["file"] or e["file"].endswith(origin_file)]
-            cone_errors    = filter_cone_errors(new_errors, cone_files, TARGET_DIR) if not changed_errors else changed_errors
+            cone_errors    = filter_cone_errors(new_errors, cone_files, get_target_dir()) if not changed_errors else changed_errors
             deduped        = dedup_errors(changed_errors if changed_errors else cone_errors, origin_file)
         finally:
             origin_path.write_bytes(backup)  # always restore
@@ -328,7 +334,7 @@ def oracle_loop(symbols, sym_by_file, call_file_edges, import_edges, sources):
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("Building graph ...")
-    symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, all_files, errors = build_graph(TARGET_DIR)
+    symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, all_files, errors = build_graph(get_target_dir())
     print(f"  {len(all_files)} files, {len(symbols)} symbols\n")
 
     log, final_code = oracle_loop(symbols, sym_by_file, call_file_edges, import_edges, sources)

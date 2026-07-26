@@ -1,0 +1,32 @@
+# cone-validate configuration
+# Copy to ~/.cone-validate/config.yaml and customize
+#
+# Environment variables override all file settings (12-factor style):
+#   CONE_TARGET_DIR, CONE_PROJECT_ROOT, CONE_GATEWAY_URL,
+#   CONE_MODEL_CHEAP, CONE_MODEL_STRONG, CONE_LOG_DIR, CONE_MAX_RETRIES
+#   GATEWAY_API_KEY (for authentication)
+
+# Directory containing TypeScript source files to analyze
+# Example: /path/to/project/frontend/src
+target_dir: ""
+
+# Project root for running tsc (where tsconfig.json lives)
+# Example: /path/to/project/frontend
+project_root: ""
+
+# LLM gateway endpoint URL
+# Example: https://gateway.example.com/v1/chat/completions
+gateway_url: ""
+
+# Model identifiers
+# Cheap/fast model for initial attempts
+model_cheap: "claude-haiku-4.5"
+
+# Strong model for escalation after retries fail
+model_strong: "kr/claude-sonnet-4.6"
+
+# Directory for debug logs (default: ./debug_logs relative to cone-validate)
+log_dir: ""
+
+# Maximum retry attempts before escalating to strong model
+max_retries: 3

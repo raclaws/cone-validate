@@ -27,7 +27,10 @@ from validate import build_graph, compute_cone
 from single_agent_test import build_context
 from oracle_loop import (
     run_tsc, make_baseline_key, filter_cone_errors, dedup_errors, format_errors, llm,
-    MODEL_CHEAP, MODEL_STRONG, MAX_RETRIES, TARGET_DIR, PROJECT_ROOT,
+)
+from config import (
+    get_target_dir, get_project_root,
+    get_model_cheap, get_model_strong, get_max_retries,
 )
 import tiktoken
 
@@ -102,12 +105,12 @@ if __name__ == "__main__":
 
     # Build graph
     print("\n[1] Building graph ...")
-    symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, all_files, errors = build_graph(TARGET_DIR)
+    symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, all_files, errors = build_graph(get_target_dir())
     print(f"    {len(all_files)} files, {len(symbols)} symbols")
 
     target_sym  = "createBudgetStore"
     origin_file = symbols[target_sym]["file"]
-    origin_path = TARGET_DIR / origin_file
+    origin_path = get_target_dir() / origin_file
     origin_src  = sources[origin_file].decode("utf-8", errors="replace")
     cone_files  = compute_cone(target_sym, symbols, sym_by_file, call_file_edges, import_edges)
     cone_ctx    = build_context(cone_files, sources)
@@ -117,7 +120,7 @@ if __name__ == "__main__":
 
     # Baseline
     print("\n[2] Baseline tsc check ...")
-    baseline_errors = run_tsc(PROJECT_ROOT)
+    baseline_errors = run_tsc(get_project_root())
     baseline_keys   = {make_baseline_key(e) for e in baseline_errors}
     print(f"    Baseline errors: {len(baseline_errors)}")
 
@@ -125,18 +128,18 @@ if __name__ == "__main__":
     print("\n[3] Oracle loop ...")
     log = []
     current_code = origin_src
-    model = MODEL_CHEAP
+    model = get_model_cheap()
     last_errors = []
 
-    for attempt in range(1, MAX_RETRIES + 2):
-        is_escalation = attempt > MAX_RETRIES
+    for attempt in range(1, get_max_retries() + 2):
+        is_escalation = attempt > get_max_retries()
         if attempt == 1:
             prompt = HARD_TASK + origin_src
             label  = f"Attempt {attempt}"
         elif is_escalation:
             prompt = hard_escalation_prompt(origin_src, cone_ctx, format_errors(last_errors))
-            model  = MODEL_STRONG
-            label  = f"ESCALATION ({MODEL_STRONG})"
+            model  = get_model_strong()
+            label  = f"ESCALATION ({get_model_strong()})"
         else:
             prompt = hard_retry_prompt(origin_src, current_code, format_errors(last_errors), attempt)
             label  = f"Attempt {attempt} (retry)"
@@ -154,7 +157,7 @@ if __name__ == "__main__":
         backup = origin_path.read_bytes()
         try:
             origin_path.write_text(new_code)
-            all_err = run_tsc(PROJECT_ROOT)
+            all_err = run_tsc(get_project_root())
             new_err = [e for e in all_err if make_baseline_key(e) not in baseline_keys]
 
             # Separate definition errors from caller errors

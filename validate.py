@@ -20,7 +20,7 @@ TS_LANGUAGE = Language(ts_typescript.language_typescript())
 parser = Parser(TS_LANGUAGE)
 enc = tiktoken.get_encoding("cl100k_base")
 
-TARGET_DIR = Path("/root/repos/twenty-dollar/frontend/src/lib")
+TARGET_DIR = Path("/root/repos/twenty-dollar/frontend/src/lib")  # Legacy default, use config
 
 def tokens(text: str) -> int:
     return len(enc.encode(text))
@@ -285,10 +285,48 @@ def measure(symbols, sym_by_file, call_file_edges, import_edges, sources, all_fi
     return results, total_repo_tokens, total_files
 
 
+# ── Persistence helpers ───────────────────────────────────────────────────────
+def save_graph(graph_data: tuple, db_path=None) -> float:
+    """
+    Save graph to SQLite. Returns save time in ms.
+    
+    Args:
+        graph_data: tuple from build_graph() - (symbols, sym_by_file, call_edges,
+                    call_file_edges, import_edges, sources, all_files, parse_errors)
+        db_path: optional custom database path
+    """
+    from persistence import GraphStore
+    store = GraphStore(db_path) if db_path else GraphStore()
+    symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, all_files, parse_errors = graph_data
+    return store.save(symbols, sym_by_file, call_edges, call_file_edges,
+                      import_edges, sources, all_files, parse_errors)
+
+
+def load_graph(db_path=None) -> tuple | None:
+    """
+    Load graph from SQLite. Returns tuple matching build_graph() output,
+    or None if no saved state.
+    
+    Returns: (symbols, sym_by_file, call_edges, call_file_edges,
+              import_edges, sources, all_files, parse_errors)
+              Plus load_time_ms as 9th element.
+    """
+    from persistence import GraphStore
+    store = GraphStore(db_path) if db_path else GraphStore()
+    return store.load()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print(f"Parsing {TARGET_DIR} ...")
-    symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, all_files, errors = build_graph(TARGET_DIR)
+    # Use config if available, otherwise fall back to hardcoded default
+    try:
+        from config import get_target_dir
+        target = get_target_dir()
+    except (ImportError, ValueError):
+        target = TARGET_DIR
+    
+    print(f"Parsing {target} ...")
+    symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, all_files, errors = build_graph(target)
 
     print(f"  Files parsed:  {len(all_files) - errors} / {len(all_files)}")
     print(f"  Parse errors:  {errors}")

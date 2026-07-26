@@ -22,8 +22,10 @@ from oracle_loop import (
     run_tsc, make_baseline_key, filter_cone_errors,
     dedup_errors, format_errors, llm,
     WRITE_PROMPT, retry_prompt, escalation_prompt,
-    MODEL_CHEAP, MODEL_STRONG, MAX_RETRIES,
-    TARGET_DIR, PROJECT_ROOT,
+)
+from config import (
+    get_target_dir, get_project_root,
+    get_model_cheap, get_model_strong, get_max_retries,
 )
 from subscription import SubscriptionBus
 
@@ -79,12 +81,12 @@ if __name__ == "__main__":
 
     # ── Graph ─────────────────────────────────────────────────────────────────
     print("\n[1/5] Building graph ...")
-    symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, all_files, errors = build_graph(TARGET_DIR)
+    symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, all_files, errors = build_graph(get_target_dir())
     print(f"      {len(all_files)} files, {len(symbols)} symbols")
 
     target_sym  = "createBudgetStore"
     origin_file = symbols[target_sym]["file"]
-    origin_path = TARGET_DIR / origin_file
+    origin_path = get_target_dir() / origin_file
     origin_src  = sources[origin_file].decode("utf-8", errors="replace")
     cone_files  = compute_cone(target_sym, symbols, sym_by_file, call_file_edges, import_edges)
     cone_ctx    = build_context(cone_files, sources)
@@ -98,25 +100,25 @@ if __name__ == "__main__":
 
     # ── Oracle loop: Agent A writes + tsc validates ───────────────────────────
     print("\n[3/5] Oracle loop: Agent A writes reset(), tsc validates ...")
-    baseline_errors = run_tsc(PROJECT_ROOT)
+    baseline_errors = run_tsc(get_project_root())
     baseline_keys   = {make_baseline_key(e) for e in baseline_errors}
     print(f"      Baseline tsc errors: {len(baseline_errors)}")
 
     log = []
     current_code = origin_src
-    model = MODEL_CHEAP
+    model = get_model_cheap()
     last_errors = []
     final_code = None
 
-    for attempt in range(1, MAX_RETRIES + 2):
-        is_escalation = attempt > MAX_RETRIES
+    for attempt in range(1, get_max_retries() + 2):
+        is_escalation = attempt > get_max_retries()
         if attempt == 1:
             prompt = WRITE_PROMPT + origin_src
             label  = f"Agent A attempt {attempt}"
         elif is_escalation:
             prompt = escalation_prompt(origin_src, cone_ctx, format_errors(last_errors))
-            model  = MODEL_STRONG
-            label  = f"Agent A ESCALATION ({MODEL_STRONG})"
+            model  = get_model_strong()
+            label  = f"Agent A ESCALATION ({get_model_strong()})"
         else:
             prompt = retry_prompt(origin_src, current_code, format_errors(last_errors), attempt)
             label  = f"Agent A retry {attempt}"
@@ -132,10 +134,10 @@ if __name__ == "__main__":
         backup = origin_path.read_bytes()
         try:
             origin_path.write_text(new_code)
-            all_err   = run_tsc(PROJECT_ROOT)
+            all_err   = run_tsc(get_project_root())
             new_err   = [e for e in all_err if make_baseline_key(e) not in baseline_keys]
             chg_err   = [e for e in new_err if origin_file in e["file"] or e["file"].endswith(origin_file)]
-            cone_err  = filter_cone_errors(new_err, cone_files, TARGET_DIR) if not chg_err else chg_err
+            cone_err  = filter_cone_errors(new_err, cone_files, get_target_dir()) if not chg_err else chg_err
             deduped   = dedup_errors(chg_err if chg_err else cone_err, origin_file)
         finally:
             origin_path.write_bytes(backup)

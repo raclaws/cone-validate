@@ -18,11 +18,17 @@ sys.path.insert(0, str(Path(__file__).parent))
 from validate import build_graph, compute_cone
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TARGET_DIR   = Path("/root/repos/twenty-dollar/frontend/src/lib")
+try:
+    from config import get_target_dir, get_gateway_url, get_api_key
+    TARGET_DIR = get_target_dir()
+    GATEWAY_URL = get_gateway_url()
+    API_KEY = get_api_key()
+except (ImportError, ValueError):
+    TARGET_DIR   = Path("/root/repos/twenty-dollar/frontend/src/lib")  # Legacy fallback
+    GATEWAY_URL  = ""
+    API_KEY      = os.environ.get("GATEWAY_API_KEY", "")
 TARGET_SYM   = "createBudgetStore"
-GATEWAY_URL  = "https://llm-gateway.selfhost.irfnmzk.work/v1/chat/completions"
 MODEL        = "anthropic/claude-haiku-4"   # cheap, fast — right model for the cascade test
-API_KEY      = os.environ.get("GATEWAY_API_KEY", "")
 
 enc = tiktoken.get_encoding("cl100k_base")
 

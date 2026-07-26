@@ -26,9 +26,15 @@ from validate import (
 from single_agent_test import build_context
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TARGET_DIR  = Path("/root/repos/twenty-dollar/frontend/src")
-GATEWAY_URL = "https://gateway.ai.cloudflare.com/v1/66bc302ceeffd5db7f4e1c191467acd8/default1/custom-deadog/v1/chat/completions"
-API_KEY = os.environ.get("GATEWAY_API_KEY", "")
+try:
+    from config import get_target_dir, get_gateway_url, get_api_key
+    TARGET_DIR = get_target_dir()
+    GATEWAY_URL = get_gateway_url()
+    API_KEY = get_api_key()
+except (ImportError, ValueError):
+    TARGET_DIR  = Path("/root/repos/twenty-dollar/frontend/src")  # Legacy fallback
+    GATEWAY_URL = ""
+    API_KEY = os.environ.get("GATEWAY_API_KEY", "")
 MODEL       = "claude-haiku-4.5"
 
 enc = tiktoken.get_encoding("cl100k_base")

@@ -14,12 +14,13 @@ Usage:
   python3 debugger.py --report           # generate report from last run
 """
 
-import os, sys, json, time, uuid, hashlib, tempfile, shutil
+import os, sys, json, time, uuid, hashlib, tempfile, shutil, threading
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -27,12 +28,14 @@ from validate import build_graph, compute_cone, parser, extract_symbols
 from subscription import SubscriptionBus
 from oracle_loop import (
     run_tsc, make_baseline_key, filter_cone_errors, dedup_errors, llm,
-    MODEL_CHEAP, MODEL_STRONG, TARGET_DIR, PROJECT_ROOT,
+)
+from config import (
+    get_target_dir, get_project_root, get_log_dir,
+    get_model_cheap, get_model_strong, reload_config,
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-LOG_DIR = Path(__file__).parent / "debug_logs"
-LOG_DIR.mkdir(exist_ok=True)
+LOG_DIR = get_log_dir()
 
 
 # ── Structured Logging ────────────────────────────────────────────────────────
@@ -111,7 +114,7 @@ class CorrectnessTests:
     def setup(self):
         """Load graph once for all tests."""
         start = time.time()
-        self.graph_data = build_graph(TARGET_DIR)
+        self.graph_data = build_graph(get_target_dir())
         self.logger.log("graph_loaded", {
             "files": len(self.graph_data[6]),
             "symbols": len(self.graph_data[0]),
@@ -280,7 +283,7 @@ class CostEfficiencyTests:
         self.graph_data = None
 
     def setup(self):
-        self.graph_data = build_graph(TARGET_DIR)
+        self.graph_data = build_graph(get_target_dir())
 
     def test_token_savings(self) -> TestResult:
         """Cone context should be significantly smaller than full context.
@@ -352,7 +355,7 @@ class CostEfficiencyTests:
     def test_graph_build_time(self) -> TestResult:
         """Graph should build in <5s for this codebase."""
         start = time.time()
-        _ = build_graph(TARGET_DIR)
+        _ = build_graph(get_target_dir())
         elapsed = time.time() - start
 
         # Scale target: 5s for 500 files, so for 61 files ~ 0.6s
@@ -401,7 +404,7 @@ class ReliabilityTests:
 
     def test_parse_success_rate(self) -> TestResult:
         """Parse success rate should be >99%."""
-        result = build_graph(TARGET_DIR)
+        result = build_graph(get_target_dir())
         _, _, _, _, _, _, all_files, parse_errors = result
 
         total = len(all_files)
@@ -424,22 +427,54 @@ class ReliabilityTests:
         )
 
     def test_concurrent_subscriptions(self) -> TestResult:
-        """Multiple agents subscribing concurrently should not corrupt state."""
+        """Multiple agents reading and writing concurrently should not corrupt state."""
         bus = SubscriptionBus(window=300)
-        errors = []
+        notifications_received = []
+        notifications_lock = threading.Lock()
+        agent_completed = []
+        completed_lock = threading.Lock()
 
-        def agent_work(agent_id: str):
+        def reader_agent(agent_id: str):
+            """Agent that reads symbols."""
             try:
-                # Subscribe to symbols
-                bus.record_reads(agent_id, [f"sym_{i}" for i in range(10)])
-                time.sleep(0.01)  # Simulate work
+                for i in range(20):
+                    bus.record_reads(agent_id, [f"sym_{i}", "shared_sym"])
+                    time.sleep(0.001)
+                with completed_lock:
+                    agent_completed.append(agent_id)
                 return True
             except Exception as e:
                 return str(e)
 
-        # Run 10 agents concurrently
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = [executor.submit(agent_work, f"agent_{i}") for i in range(10)]
+        def writer_agent(agent_id: str, target_sym: str):
+            """Agent that emits deltas (also records some reads for cross-notification)."""
+            try:
+                # Writer also reads so it can be notified by other writers
+                bus.record_reads(agent_id, ["shared_sym", "writer_sym"])
+                for i in range(10):
+                    notifs = bus.emit_delta(
+                        agent_id,
+                        f"file_{agent_id}_{i}.ts",
+                        [target_sym, f"sym_{i}"],
+                        f"// modified by {agent_id}"
+                    )
+                    with notifications_lock:
+                        notifications_received.extend(notifs)
+                    time.sleep(0.002)
+                with completed_lock:
+                    agent_completed.append(agent_id)
+                return True
+            except Exception as e:
+                return str(e)
+
+        # Scenario: 3 agents — 1 reading, 2 writing
+        # Reader subscribes to shared_sym, writers emit deltas for shared_sym
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [
+                executor.submit(reader_agent, "reader_1"),
+                executor.submit(writer_agent, "writer_1", "shared_sym"),
+                executor.submit(writer_agent, "writer_2", "shared_sym"),
+            ]
             results = [f.result() for f in as_completed(futures)]
 
         # Check all succeeded
@@ -448,23 +483,252 @@ class ReliabilityTests:
 
         # Verify state integrity
         state = bus.state()
-        expected_agents = 10
+        expected_agents = 3  # 1 reader + 2 writers (all record reads now)
         actual_agents = len(state["reads"])
 
+        # Verify all agents completed
+        all_completed = len(agent_completed) == 3
+
+        # Verify notifications were delivered (reader should have pending notifications)
+        reader_pending = bus.pending_count("reader_1")
+
         self.logger.log("concurrent_subscriptions", {
-            "agents": 10,
+            "agents": 3,
             "failures": len(failures),
             "state_agents": actual_agents,
+            "notifications_queued": len(notifications_received),
+            "reader_pending": reader_pending,
+            "all_completed": all_completed,
             "passed": passed,
         })
 
         return TestResult(
             "concurrent_subscriptions",
-            passed and actual_agents == expected_agents,
+            passed and actual_agents == expected_agents and all_completed,
             metric=actual_agents,
             target=expected_agents,
-            details={"failures": failures},
+            details={
+                "failures": failures,
+                "notifications_total": len(notifications_received),
+                "reader_pending": reader_pending,
+                "agents_completed": len(agent_completed),
+            },
         )
+
+    def test_concurrent_stress(self) -> TestResult:
+        """Stress test: 10 agents, 100 operations each, mixed reads/writes."""
+        bus = SubscriptionBus(window=300)
+        errors = []
+        operation_counts = defaultdict(int)
+        counts_lock = threading.Lock()
+        all_notifications = []
+        notif_lock = threading.Lock()
+
+        def mixed_agent(agent_id: str, ops: int = 100):
+            """Agent that does mixed read/write operations."""
+            local_ops = 0
+            local_notifs = []
+            try:
+                for i in range(ops):
+                    if i % 3 == 0:
+                        # Write operation
+                        notifs = bus.emit_delta(
+                            agent_id,
+                            f"file_{agent_id}.ts",
+                            [f"sym_{i % 10}", "common_sym"],
+                            f"// change {i}"
+                        )
+                        local_notifs.extend(notifs)
+                    else:
+                        # Read operation
+                        bus.record_reads(agent_id, [f"sym_{i % 10}", "common_sym"])
+                    local_ops += 1
+
+                with counts_lock:
+                    operation_counts[agent_id] = local_ops
+                with notif_lock:
+                    all_notifications.extend(local_notifs)
+                return True
+            except Exception as e:
+                return str(e)
+
+        # Run 10 agents concurrently
+        num_agents = 10
+        ops_per_agent = 100
+
+        with ThreadPoolExecutor(max_workers=num_agents) as executor:
+            futures = [
+                executor.submit(mixed_agent, f"agent_{i}", ops_per_agent)
+                for i in range(num_agents)
+            ]
+            results = [f.result() for f in as_completed(futures)]
+
+        # Check all succeeded
+        failures = [r for r in results if r is not True]
+
+        # Verify operation counts
+        total_ops = sum(operation_counts.values())
+        expected_ops = num_agents * ops_per_agent
+
+        # Verify state consistency
+        state = bus.state()
+        agents_in_state = len(state["reads"])
+
+        # All agents should be in state
+        state_consistent = agents_in_state == num_agents
+        ops_consistent = total_ops == expected_ops
+        no_failures = len(failures) == 0
+
+        passed = state_consistent and ops_consistent and no_failures
+
+        self.logger.log("concurrent_stress", {
+            "num_agents": num_agents,
+            "ops_per_agent": ops_per_agent,
+            "total_ops": total_ops,
+            "expected_ops": expected_ops,
+            "agents_in_state": agents_in_state,
+            "failures": len(failures),
+            "notifications_generated": len(all_notifications),
+            "passed": passed,
+        })
+
+        return TestResult(
+            "concurrent_stress",
+            passed,
+            metric=total_ops,
+            target=expected_ops,
+            details={
+                "agents": num_agents,
+                "ops_per_agent": ops_per_agent,
+                "agents_in_state": agents_in_state,
+                "notifications": len(all_notifications),
+                "failures": failures[:3] if failures else [],
+            },
+        )
+
+    def test_crash_recovery(self) -> TestResult:
+        """Graph and subscription state should survive simulated crash (process restart)."""
+        import tempfile
+        import subprocess
+        import sys
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test_crash.db"
+            
+            # Phase 1: Save state (simulating pre-crash state)
+            from validate import build_graph, save_graph, load_graph
+            from persistence import GraphStore, SubscriptionStore
+            
+            # Build and save graph
+            graph_data = build_graph(get_target_dir())
+            symbols_before = graph_data[0]
+            sym_count_before = len(symbols_before)
+            
+            graph_store = GraphStore(db_path)
+            save_time = graph_store.save(*graph_data)
+            
+            # Save subscription state
+            sub_store = SubscriptionStore(db_path)
+            test_reads = {
+                "agent_a": [("sym1", time.time()), ("sym2", time.time())],
+                "agent_b": [("sym3", time.time())],
+            }
+            sub_store.save_reads(test_reads)
+            
+            # Phase 2: Simulate crash by loading in subprocess (fresh Python process)
+            parent_dir = str(Path(__file__).parent)
+            recovery_script = f'''
+import sys
+sys.path.insert(0, "{parent_dir}")
+from pathlib import Path
+from persistence import GraphStore, SubscriptionStore
+import json
+
+db_path = Path("{db_path}")
+graph_store = GraphStore(db_path)
+sub_store = SubscriptionStore(db_path)
+
+# Load graph
+loaded = graph_store.load()
+if loaded is None:
+    print(json.dumps({{"error": "graph_load_failed"}}))
+    sys.exit(1)
+
+symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, all_files, parse_errors, load_time_ms = loaded
+
+# Load subscriptions
+reads = sub_store.load_reads()
+
+result = {{
+    "sym_count": len(symbols),
+    "load_time_ms": load_time_ms,
+    "reads_agents": list(reads.keys()),
+    "reads_count": sum(len(v) for v in reads.values()),
+}}
+print(json.dumps(result))
+'''
+            
+            # Run in subprocess to simulate fresh process
+            proc = subprocess.run(
+                [sys.executable, "-c", recovery_script],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            
+            if proc.returncode != 0:
+                return TestResult(
+                    "crash_recovery",
+                    False,
+                    error=f"Subprocess failed: {proc.stderr}",
+                )
+            
+            try:
+                result = json.loads(proc.stdout.strip())
+            except json.JSONDecodeError as e:
+                return TestResult(
+                    "crash_recovery",
+                    False,
+                    error=f"Invalid JSON: {proc.stdout[:200]}",
+                )
+            
+            if "error" in result:
+                return TestResult("crash_recovery", False, error=result["error"])
+            
+            # Verify recovery
+            sym_count_after = result["sym_count"]
+            load_time_ms = result["load_time_ms"]
+            reads_recovered = result["reads_count"]
+            
+            symbols_match = sym_count_after == sym_count_before
+            reads_match = reads_recovered == 3  # 2 + 1 from test_reads
+            load_fast = load_time_ms < 100  # Target: <100ms
+
+            passed = symbols_match and reads_match and load_fast
+
+            self.logger.log("crash_recovery", {
+                "sym_count_before": sym_count_before,
+                "sym_count_after": sym_count_after,
+                "symbols_match": symbols_match,
+                "reads_recovered": reads_recovered,
+                "reads_match": reads_match,
+                "load_time_ms": load_time_ms,
+                "load_fast": load_fast,
+                "passed": passed,
+            })
+
+            return TestResult(
+                "crash_recovery",
+                passed,
+                metric=load_time_ms,
+                target=100.0,
+                details={
+                    "sym_count_before": sym_count_before,
+                    "sym_count_after": sym_count_after,
+                    "reads_recovered": reads_recovered,
+                    "load_time_ms": load_time_ms,
+                },
+            )
 
     def run(self) -> SuiteResult:
         start = time.time()
@@ -472,6 +736,8 @@ class ReliabilityTests:
         results = [
             self.test_parse_success_rate(),
             self.test_concurrent_subscriptions(),
+            self.test_concurrent_stress(),
+            self.test_crash_recovery(),
         ]
 
         return SuiteResult(
@@ -607,7 +873,14 @@ if __name__ == "__main__":
     arg_parser.add_argument("--report", "-r", action="store_true", help="Generate markdown report")
     arg_parser.add_argument("--output", "-o", help="Report output file")
     arg_parser.add_argument("--list", "-l", action="store_true", help="List available suites")
+    arg_parser.add_argument("--config", "-c", help="Path to config file (default: ~/.cone-validate/config.yaml)")
     args = arg_parser.parse_args()
+
+    # Load config from specified file if provided
+    if args.config:
+        reload_config(args.config)
+        # Update LOG_DIR after config reload
+        LOG_DIR = get_log_dir()
 
     if args.list:
         print("Available suites:")

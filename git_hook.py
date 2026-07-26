@@ -23,9 +23,16 @@ from validate import (
 from subscription import SubscriptionBus
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# These get overridden when used as a library
-TARGET_DIR   = Path("/root/repos/twenty-dollar/frontend/src")
-PROJECT_ROOT = Path("/root/repos/twenty-dollar/frontend")
+TARGET_DIR   = Path("/root/repos/twenty-dollar/frontend/src")  # Legacy default
+PROJECT_ROOT = Path("/root/repos/twenty-dollar/frontend")      # Legacy default
+
+# Import config - these override the legacy defaults when config is set
+try:
+    from config import get_target_dir, get_project_root
+    TARGET_DIR = get_target_dir()
+    PROJECT_ROOT = get_project_root()
+except (ImportError, ValueError):
+    pass  # Use legacy defaults if config not available
 
 # Global bus — in production this would be a persistent service
 _bus: SubscriptionBus | None = None
