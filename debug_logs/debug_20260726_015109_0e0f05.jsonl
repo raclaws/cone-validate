@@ -1,0 +1,4 @@
+{"trace_id": "debug_20260726_015109_0e0f05", "timestamp": "2026-07-26T01:51:09.368417Z", "event": "run_started", "data": {"filter": null}, "duration_ms": null}
+{"trace_id": "debug_20260726_015109_0e0f05", "timestamp": "2026-07-26T01:51:09.801948Z", "event": "graph_loaded", "data": {"files": 61, "symbols": 331}, "duration_ms": 433.3486557006836}
+{"trace_id": "debug_20260726_015109_0e0f05", "timestamp": "2026-07-26T01:51:09.809991Z", "event": "ast_diff_determinism", "data": {"runs": 5, "unique_results": 1, "passed": true}, "duration_ms": null}
+{"trace_id": "debug_20260726_015109_0e0f05", "timestamp": "2026-07-26T01:51:09.810234Z", "event": "path_alias_resolution", "data": {"total_imports": 197, "unresolved": 12, "passed": false}, "duration_ms": null}

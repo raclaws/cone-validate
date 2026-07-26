@@ -1,0 +1,2 @@
+{"trace_id": "debug_20260726_015048_baf6db", "timestamp": "2026-07-26T01:50:48.480616Z", "event": "run_started", "data": {"filter": null}, "duration_ms": null}
+{"trace_id": "debug_20260726_015048_baf6db", "timestamp": "2026-07-26T01:50:48.913068Z", "event": "graph_loaded", "data": {"files": 61, "symbols": 331}, "duration_ms": 432.2800636291504}

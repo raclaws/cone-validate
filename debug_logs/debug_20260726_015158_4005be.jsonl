@@ -1,0 +1,10 @@
+{"trace_id": "debug_20260726_015158_4005be", "timestamp": "2026-07-26T01:51:58.561250Z", "event": "run_started", "data": {"filter": null}, "duration_ms": null}
+{"trace_id": "debug_20260726_015158_4005be", "timestamp": "2026-07-26T01:51:59.011171Z", "event": "graph_loaded", "data": {"files": 61, "symbols": 331}, "duration_ms": 449.7385025024414}
+{"trace_id": "debug_20260726_015158_4005be", "timestamp": "2026-07-26T01:51:59.019342Z", "event": "ast_diff_determinism", "data": {"runs": 5, "unique_results": 1, "passed": true}, "duration_ms": null}
+{"trace_id": "debug_20260726_015158_4005be", "timestamp": "2026-07-26T01:51:59.019656Z", "event": "path_alias_resolution", "data": {"total_imports": 197, "unresolved": 12, "passed": false}, "duration_ms": null}
+{"trace_id": "debug_20260726_015158_4005be", "timestamp": "2026-07-26T01:51:59.019818Z", "event": "delta_propagation_coverage", "data": {"callers_found": 4, "notifications_sent": 4, "missed": [], "passed": true}, "duration_ms": null}
+{"trace_id": "debug_20260726_015158_4005be", "timestamp": "2026-07-26T01:51:59.638391Z", "event": "token_savings", "data": {"full_tokens": 93931, "cone_tokens": 59853, "savings_pct": 36.2798224228423, "passed": false}, "duration_ms": null}
+{"trace_id": "debug_20260726_015158_4005be", "timestamp": "2026-07-26T01:52:00.078115Z", "event": "graph_build_time", "data": {"elapsed_s": 0.4394955635070801, "target_s": 1.0, "file_count": 61, "passed": true}, "duration_ms": null}
+{"trace_id": "debug_20260726_015158_4005be", "timestamp": "2026-07-26T01:52:00.534934Z", "event": "parse_success_rate", "data": {"total_files": 61, "parse_errors": 0, "success_rate": 100.0, "passed": true}, "duration_ms": null}
+{"trace_id": "debug_20260726_015158_4005be", "timestamp": "2026-07-26T01:52:00.550380Z", "event": "concurrent_subscriptions", "data": {"agents": 10, "failures": 0, "state_agents": 10, "passed": true}, "duration_ms": null}
+{"trace_id": "debug_20260726_015158_4005be", "timestamp": "2026-07-26T01:52:00.550567Z", "event": "run_completed", "data": {"suites": 3, "total_tests": 7, "passed": 5}, "duration_ms": null}
