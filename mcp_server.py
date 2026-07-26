@@ -191,6 +191,46 @@ async def list_tools():
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
+    # Handle tools that don't need graph first
+    if name == "set_project":
+        target_dir = arguments["target_dir"]
+        project_root = arguments.get("project_root")
+        
+        # Validate path exists
+        if not Path(target_dir).exists():
+            return [TextContent(type="text", text=json.dumps({
+                "error": f"Target directory does not exist: {target_dir}"
+            }))]
+        
+        set_project(target_dir, project_root)
+        
+        return [TextContent(type="text", text=json.dumps({
+            "success": True,
+            "target_dir": target_dir,
+            "project_root": project_root or str(Path(target_dir).parent),
+            "message": "Project changed. Graph will rebuild on next tool call."
+        }, indent=2))]
+    
+    elif name == "get_project":
+        import os
+        target = os.environ.get("CONE_TARGET_DIR")
+        project = os.environ.get("CONE_PROJECT_ROOT")
+        
+        if not target:
+            return [TextContent(type="text", text=json.dumps({
+                "configured": False,
+                "error": "No project configured. Use set_project to configure."
+            }))]
+        
+        return [TextContent(type="text", text=json.dumps({
+            "configured": True,
+            "target_dir": target,
+            "project_root": project or str(Path(target).parent),
+            "graph_loaded": _graph_cache is not None,
+            "symbols": len(_graph_cache[0]) if _graph_cache else 0
+        }, indent=2))]
+    
+    # All other tools need the graph
     symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, all_files, _ = get_graph()
     
     if name == "get_cone":
@@ -334,44 +374,6 @@ async def call_tool(name: str, arguments: dict):
                 full_path.write_text(original)
             elif full_path.exists():
                 full_path.unlink()
-    
-    elif name == "set_project":
-        target_dir = arguments["target_dir"]
-        project_root = arguments.get("project_root")
-        
-        # Validate path exists
-        if not Path(target_dir).exists():
-            return [TextContent(type="text", text=json.dumps({
-                "error": f"Target directory does not exist: {target_dir}"
-            }))]
-        
-        set_project(target_dir, project_root)
-        
-        return [TextContent(type="text", text=json.dumps({
-            "success": True,
-            "target_dir": target_dir,
-            "project_root": project_root or str(Path(target_dir).parent),
-            "message": "Project changed. Graph will rebuild on next tool call."
-        }, indent=2))]
-    
-    elif name == "get_project":
-        import os
-        target = os.environ.get("CONE_TARGET_DIR")
-        project = os.environ.get("CONE_PROJECT_ROOT")
-        
-        if not target:
-            return [TextContent(type="text", text=json.dumps({
-                "configured": False,
-                "error": "No project configured. Use set_project to configure."
-            }))]
-        
-        return [TextContent(type="text", text=json.dumps({
-            "configured": True,
-            "target_dir": target,
-            "project_root": project or str(Path(target).parent),
-            "graph_loaded": _graph_cache is not None,
-            "symbols": len(_graph_cache[0]) if _graph_cache else 0
-        }, indent=2))]
     
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
