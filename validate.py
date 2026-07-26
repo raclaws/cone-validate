@@ -77,9 +77,30 @@ def extract_symbols(src: bytes, tree, file_str: str, lang: str = 'typescript') -
 
     def first_ident(node) -> str | None:
         for c in node.children:
-            if c.type in ("identifier", "property_identifier"):
+            if c.type in ("identifier", "property_identifier", "type_identifier"):
                 return src[c.start_byte:c.end_byte].decode("utf-8", errors="replace")
         return None
+    
+    def get_heritage(node) -> dict:
+        """Extract implements/extends from class or interface."""
+        heritage = {"extends": [], "implements": []}
+        for c in node.children:
+            if c.type == "class_heritage":
+                for h in c.children:
+                    if h.type == "extends_clause":
+                        for t in h.children:
+                            if t.type == "identifier" or t.type == "type_identifier":
+                                heritage["extends"].append(src[t.start_byte:t.end_byte].decode("utf-8", errors="replace"))
+                    elif h.type == "implements_clause":
+                        for t in h.children:
+                            if t.type == "identifier" or t.type == "type_identifier":
+                                heritage["implements"].append(src[t.start_byte:t.end_byte].decode("utf-8", errors="replace"))
+            elif c.type == "extends_type_clause":
+                # interface Foo extends Bar, Baz
+                for t in c.children:
+                    if t.type == "identifier" or t.type == "type_identifier":
+                        heritage["extends"].append(src[t.start_byte:t.end_byte].decode("utf-8", errors="replace"))
+        return heritage
 
     def walk(node, parent=None):
         t = node.type
@@ -92,15 +113,38 @@ def extract_symbols(src: bytes, tree, file_str: str, lang: str = 'typescript') -
             name = first_ident(node)
             if name and parent:
                 out.append(dict(name=f"{parent}.{name}", file=file_str, kind="method",
-                                start=node.start_byte, end=node.end_byte))
+                                start=node.start_byte, end=node.end_byte, parent_type=parent))
         elif t == "class_declaration":
             name = first_ident(node)
             if name:
+                heritage = get_heritage(node)
                 out.append(dict(name=name, file=file_str, kind="class",
-                                start=node.start_byte, end=node.end_byte))
+                                start=node.start_byte, end=node.end_byte,
+                                extends=heritage["extends"], implements=heritage["implements"]))
                 for c in node.children:
                     walk(c, parent=name)
                 return
+        elif t == "interface_declaration":
+            name = first_ident(node)
+            if name:
+                heritage = get_heritage(node)
+                out.append(dict(name=name, file=file_str, kind="interface",
+                                start=node.start_byte, end=node.end_byte,
+                                extends=heritage["extends"]))
+                # Extract interface methods
+                for c in node.children:
+                    if c.type == "object_type" or c.type == "interface_body":
+                        for member in c.children:
+                            if member.type in ("property_signature", "method_signature"):
+                                mname = first_ident(member)
+                                if mname:
+                                    out.append(dict(name=f"{name}.{mname}", file=file_str, kind="interface_method",
+                                                    start=member.start_byte, end=member.end_byte, parent_type=name))
+        elif t == "type_alias_declaration":
+            name = first_ident(node)
+            if name:
+                out.append(dict(name=name, file=file_str, kind="type",
+                                start=node.start_byte, end=node.end_byte))
         elif t == "lexical_declaration":
             for c in node.children:
                 if c.type == "variable_declarator":
@@ -569,16 +613,93 @@ def resolve_rust_import(imp: str, current_file: Path, target_dir: Path) -> str |
 
 
 # ── Graph build ───────────────────────────────────────────────────────────────
-def build_call_file_edges(call_edges: dict, symbols: dict) -> dict[str, set]:
-    """Resolve called names → defining files. Returns file → set[file]."""
+def build_type_hierarchy(symbols: dict) -> dict:
+    """Build type hierarchy: interface/class → implementors/extenders."""
+    # type_name → set of types that implement/extend it
+    implementors: dict[str, set] = defaultdict(set)
+    # type_name → set of method names defined on it
+    type_methods: dict[str, set] = defaultdict(set)
+    # method_name → set of types that define it
+    method_to_types: dict[str, set] = defaultdict(set)
+    
+    for name, sym in symbols.items():
+        kind = sym.get("kind", "")
+        
+        # Track class/interface inheritance
+        if kind in ("class", "interface"):
+            for ext in sym.get("extends", []):
+                implementors[ext].add(name)
+            for impl in sym.get("implements", []):
+                implementors[impl].add(name)
+        
+        # Track methods and their parent types
+        if kind in ("method", "interface_method"):
+            parent = sym.get("parent_type")
+            if parent:
+                method_name = name.split(".")[-1]  # "Foo.render" -> "render"
+                type_methods[parent].add(method_name)
+                method_to_types[method_name].add(parent)
+    
+    return {
+        "implementors": dict(implementors),
+        "type_methods": dict(type_methods),
+        "method_to_types": dict(method_to_types),
+    }
+
+
+def build_call_file_edges(call_edges: dict, symbols: dict, type_hierarchy: dict = None) -> dict[str, set]:
+    """Resolve called names → defining files. Returns file → set[file].
+    
+    With type_hierarchy: narrows method calls to types in the same lineage.
+    Without: falls back to name-based matching (may over-approximate).
+    """
     name_to_file = {name: sym["file"] for name, sym in symbols.items()}
     result: dict[str, set] = defaultdict(set)
+    
+    # Build reverse lookup: method_name → [(full_name, parent_type, file), ...]
+    method_lookup: dict[str, list] = defaultdict(list)
+    for name, sym in symbols.items():
+        if sym.get("kind") in ("method", "interface_method"):
+            method_name = name.split(".")[-1]
+            parent = sym.get("parent_type")
+            method_lookup[method_name].append((name, parent, sym["file"]))
+    
+    # Get implementors for type hierarchy narrowing
+    implementors = type_hierarchy.get("implementors", {}) if type_hierarchy else {}
+    
+    def get_type_lineage(type_name: str, seen: set = None) -> set[str]:
+        """Get all types in the lineage (type + all implementors recursively)."""
+        if seen is None:
+            seen = set()
+        if type_name in seen:
+            return seen
+        seen.add(type_name)
+        for impl in implementors.get(type_name, []):
+            get_type_lineage(impl, seen)
+        return seen
+    
     for calling_file, called_names in call_edges.items():
         for name in called_names:
+            # Direct match (functions, classes, etc.)
             if name in name_to_file:
                 target = name_to_file[name]
                 if target != calling_file:
                     result[calling_file].add(target)
+            # Method call - check if we can narrow by type
+            elif name in method_lookup:
+                candidates = method_lookup[name]
+                if len(candidates) == 1:
+                    # Only one definition - no ambiguity
+                    _, _, target = candidates[0]
+                    if target != calling_file:
+                        result[calling_file].add(target)
+                else:
+                    # Multiple definitions - include all (can't narrow without call-site type info)
+                    # Future: extract receiver type from call site for better narrowing
+                    for _, _, target in candidates:
+                        if target != calling_file:
+                            result[calling_file].add(target)
+    
     return result
 
 
@@ -689,7 +810,7 @@ def build_graph(target_dir: Path):
                 unresolved_imports += 1
         import_edges[rel] = resolved
 
-    call_file_edges = build_call_file_edges(call_edges, symbols)
+    call_file_edges = build_call_file_edges(call_edges, symbols, build_type_hierarchy(symbols))
     return symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, all_source_files, parse_errors
 
 
