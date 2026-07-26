@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import requests, tiktoken
 from validate import build_graph, compute_cone
 from single_agent_test import build_context
+from ledger import TokenLedger
 
 # ── Config ────────────────────────────────────────────────────────────────────
 from config import (
@@ -46,7 +47,8 @@ def tok(text: str) -> int:
 
 
 # ── LLM call ─────────────────────────────────────────────────────────────────
-def llm(prompt: str, model: str, label: str) -> dict:
+def llm(prompt: str, model: str, label: str, ledger: TokenLedger = None, 
+        agent_id: str = "oracle_loop", task_id: str = "unknown") -> dict:
     print(f"\n  [{label}] model={model} prompt={tok(prompt):,} tok")
     payload = {
         "model": model, "max_tokens": 2048, "stream": False,
@@ -55,11 +57,13 @@ def llm(prompt: str, model: str, label: str) -> dict:
     headers = {"Authorization": f"Bearer {get_api_key()}", "Content-Type": "application/json"}
     t0 = time.time()
     resp = requests.post(get_gateway_url(), json=payload, headers=headers, timeout=120)
-    latency = round(time.time() - t0, 2)
+    latency_s = time.time() - t0
+    latency_ms = latency_s * 1000
 
     if resp.status_code != 200:
         print(f"  [ERROR] {resp.status_code}: {resp.text[:200]}")
-        return {"reply": "", "prompt_tokens": tok(prompt), "latency": latency, "error": True}
+        return {"reply": "", "prompt_tokens": tok(prompt), "completion_tokens": 0, 
+                "latency": round(latency_s, 2), "latency_ms": latency_ms, "error": True}
 
     reply = ""
     usage = {}
@@ -86,8 +90,14 @@ def llm(prompt: str, model: str, label: str) -> dict:
 
     pt = usage.get("prompt_tokens", tok(prompt))
     ct = usage.get("completion_tokens", tok(reply))
-    print(f"  [{label}] latency={latency}s output={ct:,} tok")
-    return {"reply": reply, "prompt_tokens": pt, "completion_tokens": ct, "latency": latency, "error": False}
+    print(f"  [{label}] latency={latency_s:.2f}s output={ct:,} tok")
+    
+    # Record to ledger if provided
+    if ledger is not None:
+        ledger.record(agent_id, task_id, pt, ct, model, latency_ms)
+    
+    return {"reply": reply, "prompt_tokens": pt, "completion_tokens": ct, 
+            "latency": round(latency_s, 2), "latency_ms": latency_ms, "error": False}
 
 
 # ── tsc oracle ────────────────────────────────────────────────────────────────
@@ -226,7 +236,8 @@ OUTPUT RULES:
 
 
 # ── Main oracle loop ──────────────────────────────────────────────────────────
-def oracle_loop(symbols, sym_by_file, call_file_edges, import_edges, sources):
+def oracle_loop(symbols, sym_by_file, call_file_edges, import_edges, sources, 
+                ledger: TokenLedger = None):
     target_sym  = "createBudgetStore"
     origin_file = symbols[target_sym]["file"]  # lib/budget-signals.ts
     origin_path = get_target_dir() / origin_file
@@ -252,15 +263,19 @@ def oracle_loop(symbols, sym_by_file, call_file_edges, import_edges, sources):
         if attempt == 1:
             prompt = WRITE_PROMPT + origin_src
             label  = f"ATTEMPT {attempt} (write)"
+            task_id = "write"
         elif is_escalation:
             prompt = escalation_prompt(origin_src, cone_ctx, format_errors(last_errors))
             model  = get_model_strong()
             label  = f"ESCALATION (clean room, {get_model_strong()})"
+            task_id = "escalation"
         else:
             prompt = retry_prompt(origin_src, current_code, format_errors(last_errors), attempt)
             label  = f"ATTEMPT {attempt} (retry)"
+            task_id = f"retry_{attempt}"
 
-        result = llm(prompt, model, label)
+        result = llm(prompt, model, label, ledger=ledger, 
+                     agent_id="oracle_loop", task_id=task_id)
         if result.get("error"):
             print(f"  LLM call failed, aborting.")
             break
@@ -333,11 +348,16 @@ def oracle_loop(symbols, sym_by_file, call_file_edges, import_edges, sources):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    from ledger import print_cost_summary
+    
     print("Building graph ...")
     symbols, sym_by_file, call_edges, call_file_edges, import_edges, sources, all_files, errors = build_graph(get_target_dir())
     print(f"  {len(all_files)} files, {len(symbols)} symbols\n")
 
-    log, final_code = oracle_loop(symbols, sym_by_file, call_file_edges, import_edges, sources)
+    # Create ledger for this run
+    ledger = TokenLedger()
+    
+    log, final_code = oracle_loop(symbols, sym_by_file, call_file_edges, import_edges, sources, ledger=ledger)
 
     print(f"\n{'='*60}")
     print("  ORACLE LOOP SUMMARY")
@@ -355,3 +375,8 @@ if __name__ == "__main__":
     if passed:
         winning = next(e for e in log if e["passed"])
         print(f"  Won on attempt      : {winning['attempt']} ({winning['model']})")
+    
+    # Print cost summary and save ledger
+    print_cost_summary(ledger)
+    ledger.save()
+    print(f"  Ledger saved to: {ledger.db_path}")

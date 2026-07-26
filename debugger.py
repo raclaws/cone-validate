@@ -874,6 +874,7 @@ if __name__ == "__main__":
     arg_parser.add_argument("--output", "-o", help="Report output file")
     arg_parser.add_argument("--list", "-l", action="store_true", help="List available suites")
     arg_parser.add_argument("--config", "-c", help="Path to config file (default: ~/.cone-validate/config.yaml)")
+    arg_parser.add_argument("--cost", action="store_true", help="Show token usage and cost breakdown after test run")
     args = arg_parser.parse_args()
 
     # Load config from specified file if provided
@@ -903,5 +904,23 @@ if __name__ == "__main__":
         Path(output_file).parent.mkdir(parents=True, exist_ok=True)
         Path(output_file).write_text(report)
         print(f"\n  Report saved: {output_file}")
+
+    if args.cost:
+        from ledger import TokenLedger, print_cost_summary
+        # Show cost summary from recent ledger runs
+        runs = TokenLedger.list_runs(limit=5)
+        if runs:
+            print(f"\n{'='*60}")
+            print("  RECENT COST BREAKDOWN")
+            print(f"{'='*60}")
+            print(f"  {'Run ID':<30} {'Tokens':>12} {'Cost':>10}")
+            print(f"  {'-'*54}")
+            for run in runs:
+                print(f"  {run['run_id']:<30} {run['total_tokens']:>12,} ${run['total_cost_usd']:>9.4f}")
+            total_cost = sum(r['total_cost_usd'] for r in runs)
+            print(f"  {'-'*54}")
+            print(f"  {'Total (last 5 runs)':<30} {'':<12} ${total_cost:>9.4f}")
+        else:
+            print("\n  No cost data recorded yet. Run oracle_loop.py to generate data.")
 
     print(f"\n  Logs: {logger.log_file}")
